@@ -101,7 +101,8 @@ def get_agent_executor() -> AgentExecutor:
         tools=tools,
         verbose=True,              # 控制台打印思考过程（生产可关）
         handle_parsing_errors=True,  # ReAct 格式偶发解析失败时自动容错
-        max_iterations=6,          # 防止死循环，允许 6 轮检索内收敛
+        max_iterations=10,         # 防止死循环，允许 10 轮检索内收敛
+        early_stopping_method="generate",  # 达到上限时让模型汇总已检索内容作答，而非直接报错
         return_intermediate_steps=False,
     )
     return _agent_executor

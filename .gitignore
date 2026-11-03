@@ -18,12 +18,12 @@ ENV/
 .env
 .env.local
 .env.*.local
-.streamlit/secrets.toml
+**/.streamlit/secrets.toml
 
 # ---- 运行时生成的数据 ----
-data/chroma/
-data/manifest.json
-data/models/
+**/data/chroma/
+**/data/manifest.json
+**/data/models/
 *.sqlite3
 *.db
 *.log

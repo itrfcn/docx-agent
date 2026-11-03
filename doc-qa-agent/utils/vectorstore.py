@@ -7,7 +7,10 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
+
+# HF 离线模式等环境变量统一在 utils/__init__.py 设置（须先于 huggingface_hub 导入）
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -100,26 +103,100 @@ def list_sources() -> list[str]:
     return sources
 
 
-def clear_knowledge_base() -> None:
+def _try_remove_persist_files() -> bool:
     """
-    清空整个知识库（删除当前 collection）。
-    直接删除 persist_dir 下的数据，保证彻底。
-    """
-    global _vectorstore
-    if _vectorstore is not None:
-        _vectorstore.delete_collection()
-        _vectorstore = None
+    兜底：尝试物理删除持久化目录内的文件（Windows 下常被进程占用）。
 
-    # 同时尝试从磁盘物理清空
+    Returns:
+        True 表示仍有文件残留（被占用或删除失败）。
+    """
+    residual = False
     persist_dir: Path = cfg.chroma_persist_dir
-    if persist_dir.exists():
-        # 递归删除目录下所有文件/子目录
-        for child in persist_dir.iterdir():
+    if not persist_dir.exists():
+        return False
+
+    for child in persist_dir.iterdir():
+        try:
             if child.is_file() or child.is_symlink():
                 child.unlink(missing_ok=True)
             elif child.is_dir():
-                import shutil
                 shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            pass
+        # 删除后仍存在说明被占用
+        if child.exists():
+            residual = True
+    return residual
+
+
+def clear_knowledge_base() -> dict:
+    """
+    清空整个知识库。
+
+    优先在 collection 层删除数据（delete_collection + 重建同名空集合），
+    不直接物理删除正在被进程占用的 sqlite 文件，避免 Windows WinError 32。
+
+    Returns:
+        {
+            "cleared": bool,          # 数据是否已清空
+            "documents": list[str],  # 清空前的文档清单（manifest 列表）
+            "leftover": bool,        # 是否残留历史文件（不影响使用）
+        }
+    """
+    global _vectorstore
+
+    # 1. 记录清空前的文档清单，供界面提示
+    try:
+        documents = list_sources()
+    except Exception:
+        documents = []
+
+    cleared = False
+    vs: Chroma | None = None
+    try:
+        vs = _vectorstore or get_vectorstore()
+    except Exception:
+        vs = None
+
+    if vs is not None:
+        # 2. 直接删除整个 collection（数据层面清空，不触碰被占用的文件）
+        try:
+            vs.delete_collection()
+            _vectorstore = None
+            cleared = True
+        except Exception:
+            # 3. 降级方案：删除 collection 内的全部记录
+            try:
+                ids = (vs.get() or {}).get("ids") or []
+                if ids:
+                    vs.delete(ids=ids)
+                _vectorstore = vs
+                cleared = True
+            except Exception:
+                cleared = False
+
+    # 4. 重建同名空 collection，保证后续上传 / 检索立即可用（无需重启）
+    if cleared:
+        try:
+            _vectorstore = Chroma(
+                collection_name=COLLECTION_NAME,
+                embedding_function=get_embedding(),
+                persist_directory=str(cfg.chroma_persist_dir),
+            )
+        except Exception:
+            _vectorstore = None
+
+    # 5. 仅在 collection 清理失败时兜底尝试删文件，且容错处理占用异常
+    leftover = False
+    if not cleared:
+        leftover = _try_remove_persist_files()
+        if not leftover:
+            _vectorstore = None
+            cleared = True
+        # 文件被占用时删除失败，等价于没有产生新的残留
+        leftover = bool(leftover)
+
+    return {"cleared": cleared, "documents": documents, "leftover": leftover}
 
 
 def similarity_search(query: str, top_k: int | None = None) -> list[Document]:

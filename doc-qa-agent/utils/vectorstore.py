@@ -219,8 +219,23 @@ def clear_knowledge_base() -> dict:
 def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     """
     根据 query 做相似度检索，返回 LangChain Document 列表。
-    查询侧附加 bge 检索指令前缀（文档入库时不含前缀）。
+
+    - 查询侧附加 bge 检索指令前缀（文档入库时不含前缀）
+    - 按**来源**去重：每个文档最多保留 1 个片段（过量取 2 倍候选再过滤），
+      避免 top_k 名额被同一文件占用，保证返回结果覆盖更多文档
     """
     k = top_k or cfg.retriever_top_k
     vs = get_vectorstore()
-    return vs.similarity_search(f"{QUERY_INSTRUCTION}{query}", k=k)
+    candidates = vs.similarity_search(f"{QUERY_INSTRUCTION}{query}", k=k * 2)
+
+    seen_sources: set[str] = set()
+    unique: list[Document] = []
+    for doc in candidates:
+        source = doc.metadata.get("source", "")
+        if source in seen_sources:
+            continue
+        seen_sources.add(source)
+        unique.append(doc)
+        if len(unique) >= k:
+            break
+    return unique

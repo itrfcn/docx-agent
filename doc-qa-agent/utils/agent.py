@@ -100,9 +100,12 @@ def get_agent_executor() -> AgentExecutor:
         agent=agent,
         tools=tools,
         verbose=True,              # 控制台打印思考过程（生产可关）
-        handle_parsing_errors=True,  # ReAct 格式偶发解析失败时自动容错
+        handle_parsing_errors=(
+            "输出格式错误：同一条回复不能同时包含 Action 和 Final Answer。"
+            "请重新输出——要么只输出 Thought/Action/Action Input 三行后停止，要么只输出 Final Answer。"
+        ),  # 解析失败时把精确原因反馈给模型，避免盲目重试
         max_iterations=10,         # 防止死循环，允许 10 轮检索内收敛
-        early_stopping_method="generate",  # 达到上限时让模型汇总已检索内容作答，而非直接报错
+        # 注：当前 langchain 版本仅支持 early_stopping_method="force"（默认），不可用 "generate"
         return_intermediate_steps=False,
     )
     return _agent_executor

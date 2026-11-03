@@ -50,6 +50,9 @@ class Config:
     # ---- 检索 ----
     retriever_top_k: int = field(default_factory=lambda: int(_env("RETRIEVER_TOP_K", default="4")))  # type: ignore[assignment]
 
+    # ---- 管理口令（上传/清空等管理功能需要；留空则锁定管理功能）----
+    admin_password: str = field(default_factory=lambda: _env("ADMIN_PASSWORD", default=""))  # type: ignore[assignment]
+
     def ensure_dirs(self) -> None:
         """确保所有需要的目录存在。"""
         self.chroma_persist_dir.mkdir(parents=True, exist_ok=True)

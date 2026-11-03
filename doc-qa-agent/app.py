@@ -10,6 +10,8 @@ Streamlit 主程序
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import sys
 from pathlib import Path
@@ -45,54 +47,181 @@ st.set_page_config(
 st.title("📚 企业文档问答助手")
 st.caption("面向企业内部员工 · 基于 LangChain ReAct Agent + Chroma + bge-small-zh")
 
+# 隐藏浏览器（Edge/Chromium）给密码框自动加的"显示密码"按钮，
+# 避免与 Streamlit 自带的显隐按钮重复出现两个眼睛图标
+st.markdown(
+    "<style>input::-ms-reveal, input::-ms-clear { display: none; }</style>",
+    unsafe_allow_html=True,
+)
+
 # ---------------------------------------------------------------------------
-# 侧边栏：文档管理
+# 侧边栏：文档管理（上传/清空仅管理员可用，文档列表全员可见）
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("📚 文档管理")
 
-    # 清空操作的提示信息（跨 rerun 保留）
-    flash_msg = st.session_state.pop("clear_flash", None)
-    if flash_msg:
-        st.success(flash_msg)
+    # ---- 管理员认证 ----
+    if "is_admin" not in st.session_state:
+        st.session_state.is_admin = False
 
-    # ---- 上传组件 ----
-    uploaded_files = st.file_uploader(
-        "上传文档（可多选）",
-        type=list(parsers.SUPPORTED_EXTENSIONS),
-        accept_multiple_files=True,
-        help="支持 PDF / DOCX / TXT，不支持扫描件（无 OCR）。",
-    )
+    def _admin_token() -> str:
+        """由管理口令派生的访问令牌（口令修改后旧令牌自动失效）。"""
+        return hashlib.sha256(("admin-token:" + cfg.admin_password).encode()).hexdigest()[:32]
 
-    if uploaded_files:
-        col_ok, col_clear = st.columns(2)
-        if col_ok.button("✅ 入库所选文件", type="primary"):
-            progress_bar = st.progress(0.0, text="准备入库...")
-            total = len(uploaded_files)
-            success_count = 0
-            for idx, uf in enumerate(uploaded_files):
-                try:
-                    raw = uf.read()
-                    text = parsers.parse_file(raw, uf.name)
-                    chunks = vectorstore.ingest_document(text, uf.name)
-                    success_count += 1
-                    st.success(f"✅ {uf.name} — 入库 {chunks} 个切片")
-                except parsers.DocParseError as e:
-                    st.error(f"❌ {uf.name} — {e}")
-                except Exception as e:
-                    st.error(f"❌ {uf.name} — 未知错误：{e}")
+    # 刷新后恢复登录：URL 中的令牌校验通过即自动恢复管理员状态，
+    # 避免每次刷新都要重新输入口令（st.session_state 在刷新后会重建）
+    # 注：compare_digest 必须比较 bytes（str 模式不支持非 ASCII 字符）
+    if cfg.admin_password and not st.session_state.is_admin:
+        qp_token = st.query_params.get("admin_token")
+        if qp_token and hmac.compare_digest(
+            qp_token.encode("utf-8"), _admin_token().encode("utf-8")
+        ):
+            st.session_state.is_admin = True
 
-                progress_bar.progress((idx + 1) / total, text=f"已处理 {idx + 1}/{total}")
+    if not cfg.admin_password:
+        st.warning("⚠️ 未在 .env 配置 ADMIN_PASSWORD，管理功能已锁定（仅可查看文档列表）。")
+    elif st.session_state.is_admin:
+        st.success("🔓 管理员已登录")
 
-            progress_bar.empty()
-            st.info(f"入库完成：{success_count}/{total} 个文件成功。")
+    if cfg.admin_password and not st.session_state.is_admin:
+        def _attempt_login() -> None:
+            """校验输入框中的口令（回车提交与点击按钮共用）。"""
+            pwd = st.session_state.get("admin_pwd_input", "")
+            if not pwd:
+                return
+            if hmac.compare_digest(
+                pwd.encode("utf-8"), cfg.admin_password.encode("utf-8")
+            ):
+                st.session_state.is_admin = True
+                st.session_state.admin_login_error = False
+                # 令牌写入 URL，刷新 / 重开浏览器（同地址）时保持登录
+                st.query_params["admin_token"] = _admin_token()
+            else:
+                st.session_state.admin_login_error = True
+            # 清空输入框（回调发生在控件实例化前，允许改其 key）
+            st.session_state.admin_pwd_input = ""
 
-        if col_clear.button("↩️ 取消选择"):
+        st.text_input(
+            "管理员口令",
+            type="password",
+            key="admin_pwd_input",
+            on_change=_attempt_login,  # 输入框内按回车提交即校验
+        )
+        if st.button("🔓 登录管理", type="primary"):
+            _attempt_login()
+            if st.session_state.is_admin:
+                st.rerun()
+        if st.session_state.get("admin_login_error"):
+            st.error("口令错误，请重试")
+
+    if cfg.admin_password and st.session_state.is_admin:
+        # 清空操作的提示信息（跨 rerun 保留）
+        flash_msg = st.session_state.pop("clear_flash", None)
+        if flash_msg:
+            st.success(flash_msg)
+
+        # ---- 上传组件 ----
+        uploaded_files = st.file_uploader(
+            "上传文档（可多选）",
+            type=list(parsers.SUPPORTED_EXTENSIONS),
+            accept_multiple_files=True,
+            help="支持 PDF / DOCX / TXT，不支持扫描件（无 OCR）。",
+        )
+
+        if uploaded_files:
+            col_ok, col_clear = st.columns(2)
+            if col_ok.button("✅ 入库所选文件", type="primary"):
+                progress_bar = st.progress(0.0, text="准备入库...")
+                total = len(uploaded_files)
+                success_count = 0
+                for idx, uf in enumerate(uploaded_files):
+                    try:
+                        raw = uf.read()
+                        text = parsers.parse_file(raw, uf.name)
+                        chunks = vectorstore.ingest_document(text, uf.name)
+                        success_count += 1
+                        st.success(f"✅ {uf.name} — 入库 {chunks} 个切片")
+                    except parsers.DocParseError as e:
+                        st.error(f"❌ {uf.name} — {e}")
+                    except Exception as e:
+                        st.error(f"❌ {uf.name} — 未知错误：{e}")
+
+                    progress_bar.progress((idx + 1) / total, text=f"已处理 {idx + 1}/{total}")
+
+                progress_bar.empty()
+                st.info(f"入库完成：{success_count}/{total} 个文件成功。")
+
+            if col_clear.button("↩️ 取消选择"):
+                st.rerun()
+
+        # ---- 清空按钮（二次确认，防误删）----
+        st.divider()
+        if "confirm_clear" not in st.session_state:
+            st.session_state.confirm_clear = False
+
+        if not st.session_state.confirm_clear:
+            # 第一次点击只进入确认态，不执行清空
+            if st.button("🗑️ 清空整个知识库", type="secondary"):
+                st.session_state.confirm_clear = True
+                st.rerun()
+        else:
+            st.warning("⚠️ 此操作会删除全部已入库文档，且无法恢复。")
+            confirmed = st.checkbox("我确认要清空全部已入库文档")
+
+            col_yes, col_no = st.columns(2)
+            with col_yes:
+                do_clear = st.button(
+                    "确认清空",
+                    type="primary",
+                    disabled=not confirmed,
+                )
+            with col_no:
+                if st.button("取消"):
+                    st.session_state.confirm_clear = False
+                    st.rerun()
+
+            if do_clear:
+                # 二次确认通过后才真正执行
+                result = vectorstore.clear_knowledge_base()
+                docs = result.get("documents") or []
+                st.session_state.confirm_clear = False  # 执行完自动复位
+
+                if result.get("cleared"):
+                    msg = (
+                        "✅ 知识库已清空：向量集合已重建，"
+                        f"manifest 文档清单共 {len(docs)} 个"
+                    )
+                    msg += ("：" + "、".join(docs)) if docs else "。"
+                    if result.get("leftover"):
+                        msg += (
+                            "\n\nℹ️ 向量数据已清空，残留文件将在关闭程序后自动清理，不影响使用。"
+                        )
+                    st.session_state.clear_flash = msg
+                else:
+                    st.session_state.clear_flash = (
+                        "❌ 清空失败：知识库可能正被其它程序占用，请稍后重试。"
+                    )
+                st.rerun()
+
+        # ---- 退出管理 ----
+        if st.button("🔒 退出管理"):
+            st.session_state.is_admin = False
+            # 同时清除 URL 中的令牌，避免刷新后又被自动登录
+            if "admin_token" in st.query_params:
+                del st.query_params["admin_token"]
             st.rerun()
+
+        # 版本/配置提示（仅管理员可见）
+        st.divider()
+        with st.expander("🔧 当前配置"):
+            st.write(f"LLM: `{cfg.model_name}`")
+            st.write(f"Embedding: `{cfg.embedding_model}`")
+            st.write(f"向量库: `{cfg.chroma_persist_dir}`")
+            st.write(f"切片: size={cfg.chunk_size}, overlap={cfg.chunk_overlap}")
 
     st.divider()
 
-    # ---- 已入库文件列表 ----
+    # ---- 已入库文件列表（全员可见；删除仅管理员）----
     st.subheader("📂 已入库文档")
     try:
         sources = vectorstore.list_sources()
@@ -100,69 +229,40 @@ with st.sidebar:
         st.error(f"读取知识库失败：{e}")
         sources = []
 
+    is_admin_view = bool(cfg.admin_password) and st.session_state.get("is_admin", False)
+    if "pending_delete" not in st.session_state:
+        st.session_state.pending_delete = None
+
     if sources:
         for src in sources:
-            st.markdown(f"- `{src}`")
+            if not is_admin_view:
+                st.markdown(f"- `{src}`")
+                continue
+
+            col_name, col_del = st.columns([0.82, 0.18])
+            col_name.markdown(f"- `{src}`")
+            if col_del.button("🗑", key=f"del_{src}", help="删除该文档的全部切片"):
+                st.session_state.pending_delete = src
+
+            # 二次确认（仅对触发删除的那个文件显示）
+            if st.session_state.pending_delete == src:
+                st.warning(f"删除 `{src}` 的全部切片？此操作不可恢复。")
+                c_yes, c_no = st.columns(2)
+                if c_yes.button("确认删除", key=f"delok_{src}", type="primary"):
+                    try:
+                        n = vectorstore.delete_document(src)
+                        st.session_state.pending_delete = None
+                        st.session_state.clear_flash = f"✅ 已删除 {src}（{n} 个切片），其余文档不受影响"
+                    except Exception as e:
+                        st.session_state.pending_delete = None
+                        st.session_state.clear_flash = f"❌ 删除失败：{e}"
+                    st.rerun()
+                if c_no.button("取消", key=f"delno_{src}"):
+                    st.session_state.pending_delete = None
+                    st.rerun()
         st.caption(f"共 {len(sources)} 个文档")
     else:
         st.caption("（知识库为空，请先上传文档）")
-
-    # ---- 清空按钮（二次确认，防误删）----
-    st.divider()
-    if "confirm_clear" not in st.session_state:
-        st.session_state.confirm_clear = False
-
-    if not st.session_state.confirm_clear:
-        # 第一次点击只进入确认态，不执行清空
-        if st.button("🗑️ 清空整个知识库", type="secondary"):
-            st.session_state.confirm_clear = True
-            st.rerun()
-    else:
-        st.warning("⚠️ 此操作会删除全部已入库文档，且无法恢复。")
-        confirmed = st.checkbox("我确认要清空全部已入库文档")
-
-        col_yes, col_no = st.columns(2)
-        with col_yes:
-            do_clear = st.button(
-                "确认清空",
-                type="primary",
-                disabled=not confirmed,
-            )
-        with col_no:
-            if st.button("取消"):
-                st.session_state.confirm_clear = False
-                st.rerun()
-
-        if do_clear:
-            # 二次确认通过后才真正执行
-            result = vectorstore.clear_knowledge_base()
-            docs = result.get("documents") or []
-            st.session_state.confirm_clear = False  # 执行完自动复位
-
-            if result.get("cleared"):
-                msg = (
-                    "✅ 知识库已清空：向量集合已重建，"
-                    f"manifest 文档清单共 {len(docs)} 个"
-                )
-                msg += ("：" + "、".join(docs)) if docs else "。"
-                if result.get("leftover"):
-                    msg += (
-                        "\n\nℹ️ 向量数据已清空，残留文件将在关闭程序后自动清理，不影响使用。"
-                    )
-                st.session_state.clear_flash = msg
-            else:
-                st.session_state.clear_flash = (
-                    "❌ 清空失败：知识库可能正被其它程序占用，请稍后重试。"
-                )
-            st.rerun()
-
-    # 版本/配置提示
-    st.divider()
-    with st.expander("🔧 当前配置"):
-        st.write(f"LLM: `{cfg.model_name}`")
-        st.write(f"Embedding: `{cfg.embedding_model}`")
-        st.write(f"向量库: `{cfg.chroma_persist_dir}`")
-        st.write(f"切片: size={cfg.chunk_size}, overlap={cfg.chunk_overlap}")
 
 
 # ---------------------------------------------------------------------------

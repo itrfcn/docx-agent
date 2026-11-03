@@ -216,6 +216,24 @@ def clear_knowledge_base() -> dict:
     return {"cleared": cleared, "documents": documents, "leftover": leftover}
 
 
+def delete_document(filename: str) -> int:
+    """
+    删除知识库中指定文档的全部切片（按 metadata.source 精确匹配）。
+
+    Args:
+        filename: 文档名（与 list_sources 返回值一致）
+
+    Returns:
+        实际删除的切片数量
+    """
+    vs = get_vectorstore()
+    data = vs.get(where={"source": filename})
+    ids = (data or {}).get("ids") or []
+    if ids:
+        vs.delete(ids=ids)
+    return len(ids)
+
+
 def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     """
     根据 query 做相似度检索，返回 LangChain Document 列表。

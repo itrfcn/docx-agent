@@ -35,7 +35,7 @@ def knowledge_search(query: str) -> str:
         return f"[知识库检索异常] {e}"
 
     if not docs:
-        return "知识库中暂未检索到与该关键词相关的内容。"
+        return "知识库中未检索到相关片段（可能没有相关资料）。"
 
     # 去重（按内容）并格式化，附带来源
     seen: set[str] = set()
@@ -49,7 +49,7 @@ def knowledge_search(query: str) -> str:
         parts.append(f"[{source}]\n{content}")
 
     if not parts:
-        return "知识库中暂未检索到与该关键词相关的内容。"
+        return "知识库中未检索到相关片段（可能没有相关资料）。"
 
     return "\n\n---\n\n".join(parts)
 

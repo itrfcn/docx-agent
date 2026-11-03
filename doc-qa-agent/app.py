@@ -44,6 +44,14 @@ st.set_page_config(
     layout="wide",
 )
 
+# ---- 首屏配置校验 ----
+# 缺失必填项时给出友好提示并停止渲染，而不是让未捕获异常导致整页崩溃
+_missing_cfg = cfg.missing_required()
+if _missing_cfg:
+    st.error("❌ 缺少必要配置：" + "、".join(_missing_cfg))
+    st.info("请在项目根目录的 .env 文件中填写上述配置后重新启动程序。")
+    st.stop()
+
 st.title("📚 企业文档问答助手")
 st.caption("面向企业内部员工 · 基于 LangChain ReAct Agent + Chroma + bge-small-zh")
 

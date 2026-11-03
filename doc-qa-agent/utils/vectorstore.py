@@ -22,6 +22,11 @@ from utils.config import cfg
 # Chroma collection 名称（业务隔离）
 COLLECTION_NAME = "enterprise_docs"
 
+# 距离空间：cosine。使用 cosine 后 similarity_search_with_relevance_scores
+# 返回的分数才是可直接用于阈值过滤的「1 - 余弦距离」。
+# 注意：Chroma 的 collection metadata 在创建后不可修改，切换空间需重建向量库。
+COLLECTION_METADATA = {"hnsw:space": "cosine"}
+
 # bge 官方约定：查询向量需加检索指令前缀（文档侧不加），可提升召回率
 QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 
@@ -52,6 +57,7 @@ def get_vectorstore() -> Chroma:
             collection_name=COLLECTION_NAME,
             embedding_function=get_embedding(),
             persist_directory=str(cfg.chroma_persist_dir),
+            collection_metadata=COLLECTION_METADATA,
         )
     return _vectorstore
 
@@ -154,6 +160,12 @@ def clear_knowledge_base() -> dict:
     except Exception:
         documents = []
 
+    # 1.5 快照「清理前已存在的 segment 目录」。
+    #     重建 collection 后会生成新的 segment 目录，只删快照里的旧目录，
+    #     避免把刚建好的新集合目录一起删掉（那会导致清空后首次写入异常）。
+    persist_dir: Path = cfg.chroma_persist_dir
+    old_dirs: list[Path] = [p for p in persist_dir.iterdir() if p.is_dir()] if persist_dir.exists() else []
+
     cleared = False
     vs: Chroma | None = None
     try:
@@ -185,23 +197,23 @@ def clear_knowledge_base() -> dict:
                 collection_name=COLLECTION_NAME,
                 embedding_function=get_embedding(),
                 persist_directory=str(cfg.chroma_persist_dir),
+                collection_metadata=COLLECTION_METADATA,
             )
         except Exception:
             _vectorstore = None
 
-    # 5. 成功清空后，尽力删除无引用的孤儿文件（如已废弃的 HNSW 段索引）。
-    #    chroma.sqlite3 通常被运行中的进程锁定，跳过（其中已无业务数据，不影响正确性）。
+    # 5. 成功清空后，仅删除「快照里的旧 segment 目录」（新目录不在快照中，不会被误删）。
+    #    chroma.sqlite3 被运行中的进程锁定，保持不动（其中已无业务数据，不影响正确性）。
+    #    文件被占用时容错跳过，只标记 leftover，不抛 WinError 32。
     leftover = False
     if cleared:
-        for child in cfg.chroma_persist_dir.glob("*"):
-            if child.name.startswith("chroma.sqlite3"):
-                continue
+        for child in old_dirs:
             try:
-                if child.is_dir():
+                if child.exists():
                     shutil.rmtree(child)
-                else:
-                    child.unlink()
             except OSError:
+                pass
+            if child.exists():
                 leftover = True
 
     # 6. 仅在 collection 清理失败时兜底尝试删文件，且容错处理占用异常
@@ -239,12 +251,26 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     根据 query 做相似度检索，返回 LangChain Document 列表。
 
     - 查询侧附加 bge 检索指令前缀（文档入库时不含前缀）
+    - 使用 similarity_search_with_relevance_scores 取带分数结果（要求 cosine 空间）
+    - 低于 cfg.relevance_threshold 的片段直接丢弃；全部低于阈值时返回空列表，
+      由调用方明确告知「未检索到相关片段」，避免硬凑无关内容
     - 按**来源**去重：每个文档最多保留 1 个片段（过量取 2 倍候选再过滤），
       避免 top_k 名额被同一文件占用，保证返回结果覆盖更多文档
     """
     k = top_k or cfg.retriever_top_k
+    threshold = cfg.relevance_threshold
     vs = get_vectorstore()
-    candidates = vs.similarity_search(f"{QUERY_INSTRUCTION}{query}", k=k * 2)
+
+    try:
+        scored: list[tuple[Document, float]] = vs.similarity_search_with_relevance_scores(
+            f"{QUERY_INSTRUCTION}{query}", k=k * 2
+        )
+    except Exception:
+        # 兜底：极少数环境拿不到相关性分数时退回普通检索（不做阈值过滤）
+        scored = [(doc, 1.0) for doc in vs.similarity_search(f"{QUERY_INSTRUCTION}{query}", k=k * 2)]
+
+    # 相关性阈值过滤
+    candidates = [doc for doc, score in scored if score is None or score >= threshold]
 
     seen_sources: set[str] = set()
     unique: list[Document] = []

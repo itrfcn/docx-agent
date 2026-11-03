@@ -91,3 +91,4 @@ $env:HF_ENDPOINT = "https://hf-mirror.com"
 | `CHROMA_PERSIST_DIR` | 向量库持久化目录，默认 `./data/chroma` |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | 切片长度与重叠 |
 | `RETRIEVER_TOP_K` | 每次检索返回的片段数 |
+| `RELEVANCE_THRESHOLD` | 相关性阈值（0~1，默认 `0.45`）；低于该分数的片段不返回，避免硬凑无关内容 |

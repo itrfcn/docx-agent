@@ -21,9 +21,10 @@ ENV/
 **/.streamlit/secrets.toml
 
 # ---- 运行时生成的数据 ----
-**/data/chroma/
+**/data/chroma*/
 **/data/manifest.json
 **/data/models/
+**/data/docs/
 *.sqlite3
 *.db
 *.log

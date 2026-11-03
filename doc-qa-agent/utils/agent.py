@@ -58,6 +58,23 @@ def knowledge_search(query: str) -> str:
 # 2. 构造 Agent（延迟初始化，避免 Streamlit 热重载时重复加载模型）
 # ---------------------------------------------------------------------------
 _agent_executor: AgentExecutor | None = None
+_llm: ChatOpenAI | None = None
+
+
+def _get_llm() -> ChatOpenAI:
+    """LLM 单例：60 秒超时 + 2 次重试，避免单次请求长时间卡住。"""
+    global _llm
+    if _llm is None:
+        _llm = ChatOpenAI(
+            api_key=cfg.openai_api_key,
+            base_url=cfg.openai_base_url,
+            model=cfg.model_name,
+            temperature=0.1,
+            streaming=False,
+            timeout=60,
+            max_retries=2,
+        )
+    return _llm
 
 
 def get_agent_executor() -> AgentExecutor:
@@ -66,15 +83,8 @@ def get_agent_executor() -> AgentExecutor:
     if _agent_executor is not None:
         return _agent_executor
 
-    # LLM：通义千问兼容 OpenAI 接口
     # 关闭 streaming，确保模型一次返回完整输出，避免 ReAct 格式被截断
-    llm = ChatOpenAI(
-        api_key=cfg.openai_api_key,
-        base_url=cfg.openai_base_url,
-        model=cfg.model_name,
-        temperature=0.1,
-        streaming=False,
-    )
+    llm = _get_llm()
 
     tools = [knowledge_search]
 
@@ -105,6 +115,7 @@ def get_agent_executor() -> AgentExecutor:
             "请重新输出——要么只输出 Thought/Action/Action Input 三行后停止，要么只输出 Final Answer。"
         ),  # 解析失败时把精确原因反馈给模型，避免盲目重试
         max_iterations=10,         # 防止死循环，允许 10 轮检索内收敛
+        max_execution_time=120,    # 整体执行超时（秒），超时后进入降级直答
         # 注：当前 langchain 版本仅支持 early_stopping_method="force"（默认），不可用 "generate"
         return_intermediate_steps=False,
     )
@@ -114,6 +125,70 @@ def get_agent_executor() -> AgentExecutor:
 # ---------------------------------------------------------------------------
 # 3. 对外调用接口
 # ---------------------------------------------------------------------------
+_DISCLAIMER = "\n\n---\n⚠️ **本工具仅作辅助参考，请以正式文件与责任人判断为准。**"
+
+
+def _is_degraded_answer(text: str) -> bool:
+    """识别 ReAct 未正常收敛的情况（迭代/时间耗尽、空输出）。"""
+    t = (text or "").strip().lower()
+    return (not t) or ("iteration limit" in t) or ("time limit" in t) or ("agent stopped" in t)
+
+
+def _direct_answer(question: str) -> str:
+    """
+    降级路径：直接检索知识库 → 一次 LLM 直答。
+
+    ReAct 解析失败 / 迭代耗尽 / 请求超时时使用，避免把英文技术报错暴露给用户。
+    """
+    try:
+        docs = vectorstore.similarity_search(question)
+    except Exception:
+        docs = []
+
+    if not docs:
+        return "抱歉，知识库中暂未检索到与该问题相关的资料，无法回答该问题。" + _DISCLAIMER
+
+    context_parts: list[str] = []
+    source_names: list[str] = []
+    for doc in docs:
+        source = doc.metadata.get("source", "未知来源")
+        content = (doc.page_content or "").strip()
+        if not content:
+            continue
+        context_parts.append(f"[{source}]\n{content}")
+        if source not in source_names:
+            source_names.append(source)
+
+    if not context_parts:
+        return "抱歉，知识库中暂未检索到与该问题相关的资料，无法回答该问题。" + _DISCLAIMER
+
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "你是企业内部文档问答助手。只能依据用户提供的资料回答；"
+            "资料不足时必须明确说明未检索到相关资料，严禁编造制度、流程或数据。"
+            "用简洁中文分点陈述，每个结论后用【来源：文件名】标注来源。",
+        ),
+        ("human", "问题：{question}\n\n资料：\n{context}"),
+    ])
+
+    try:
+        msg = _get_llm().invoke(
+            prompt.format_messages(question=question, context="\n\n".join(context_parts))
+        )
+        answer = str(getattr(msg, "content", "") or "").strip()
+        if not answer:
+            raise ValueError("empty answer")
+    except Exception:
+        return "抱歉，当前无法完成回答，请稍后重试。" + _DISCLAIMER
+
+    if "【来源" not in answer and "【引用来源" not in answer:
+        answer += f"\n\n【引用来源：{'、'.join(source_names)}】"
+    if "本工具仅作辅助参考" not in answer:
+        answer += _DISCLAIMER
+    return answer
+
+
 def ask_agent(user_question: str, chat_history: list[tuple[str, str]] | None = None) -> str:
     """
     向 Agent 发起一次问答。
@@ -123,7 +198,7 @@ def ask_agent(user_question: str, chat_history: list[tuple[str, str]] | None = N
         chat_history:  历史对话，格式 [(human_msg, ai_msg), ...]
 
     Returns:
-        Agent 最终回复文本
+        Agent 最终回复文本（任何异常都会降级为友好中文答复，不返回技术报错）
     """
     executor = get_agent_executor()
 
@@ -140,8 +215,11 @@ def ask_agent(user_question: str, chat_history: list[tuple[str, str]] | None = N
             "input": user_question,
             "chat_history": lc_history,
         })
-    except Exception as e:
-        return f"[Agent 执行异常] 抱歉，推理过程中出现错误：{e}"
+        answer = str(result.get("output", "")).strip()
+    except Exception:
+        # 超时 / 限流 / 解析失败等：不把英文技术报错暴露给用户
+        answer = ""
 
-    answer = result.get("output", "")
-    return str(answer).strip()
+    if _is_degraded_answer(answer):
+        answer = _direct_answer(user_question)
+    return answer

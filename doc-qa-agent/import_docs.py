@@ -9,9 +9,10 @@
 
 规则：
     - 递归扫描 data/docs 下的 pdf / docx / txt
-    - 已入库文件自动跳过（以 Chroma 中已有的 source 名作为去重依据）
+    - 已入库且内容未变化的文件自动跳过（manifest 中的 content_hash 一致）
+    - 内容变化的文件自动「先删旧数据再重建」，避免重复片段与旧内容残留
     - 单个文件失败不影响其余文件
-    - 不删除、不覆盖原有已入库文档
+    - 不删除、不覆盖其它已入库文档
 """
 
 from __future__ import annotations
@@ -80,28 +81,42 @@ def main() -> int:
 
     print(f"发现 {len(files)} 个文件，知识库中已有 {len(existing)} 个文档\n")
 
-    added, skipped, failed = 0, 0, 0
+    added, updated, skipped, failed = 0, 0, 0, 0
     details: list[tuple[str, str, str]] = []  # (状态, 文件名, 说明)
 
     for path in files:
         name = _source_name(path)
         try:
-            if name in existing:
-                skipped += 1
-                details.append(("跳过", name, "已入库"))
-                print(f"[跳过] {name} —— 已入库")
-                continue
-
             raw = path.read_bytes()
             text = parsers.parse_file(raw, path.name)
+            digest = vectorstore.content_hash(text)
+
+            # 已入库且内容未变化 → 跳过；内容变化（或缺少 manifest 记录）→ 重建
+            entry = vectorstore.get_manifest_entry(name)
+            unchanged = (
+                name in existing
+                and isinstance(entry, dict)
+                and entry.get("content_hash") == digest
+            )
+            if unchanged:
+                skipped += 1
+                details.append(("跳过", name, "内容未变化"))
+                print(f"[跳过] {name} —— 内容未变化")
+                continue
+
             chunks = vectorstore.ingest_document(text, name)
             if chunks <= 0:
                 raise RuntimeError("解析后无有效文本切片")
 
-            added += 1
+            if name in existing:
+                updated += 1
+                details.append(("更新", name, f"{chunks} 个切片"))
+                print(f"[更新] {name} —— 内容已变化，重建 {chunks} 个切片")
+            else:
+                added += 1
+                details.append(("新增", name, f"{chunks} 个切片"))
+                print(f"[新增] {name} —— {chunks} 个切片")
             existing.add(name)
-            details.append(("新增", name, f"{chunks} 个切片"))
-            print(f"[新增] {name} —— {chunks} 个切片")
         except parsers.DocParseError as e:
             failed += 1
             details.append(("失败", name, str(e)))
@@ -112,7 +127,7 @@ def main() -> int:
             print(f"[失败] {name} —— 未知错误：{e}")
 
     print("\n" + "-" * 64)
-    print(f"汇总：新增 {added} 个 / 跳过 {skipped} 个 / 失败 {failed} 个")
+    print(f"汇总：新增 {added} 个 / 更新 {updated} 个 / 跳过 {skipped} 个 / 失败 {failed} 个")
     if failed:
         print("失败明细：")
         for status, name, reason in details:

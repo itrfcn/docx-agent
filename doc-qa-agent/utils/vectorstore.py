@@ -7,7 +7,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 # HF 离线模式等环境变量统一在 utils/__init__.py 设置（须先于 huggingface_hub 导入）
@@ -26,6 +29,10 @@ COLLECTION_NAME = "enterprise_docs"
 # 返回的分数才是可直接用于阈值过滤的「1 - 余弦距离」。
 # 注意：Chroma 的 collection metadata 在创建后不可修改，切换空间需重建向量库。
 COLLECTION_METADATA = {"hnsw:space": "cosine"}
+
+# 入库清单（manifest）：记录每个 source 的 content_hash 与 chunk_count，
+# 用于判断文件内容是否变化、是否需要重建。与向量库目录同级。
+MANIFEST_PATH = cfg.chroma_persist_dir.parent / "manifest.json"
 
 # bge 官方约定：查询向量需加检索指令前缀（文档侧不加），可提升召回率
 QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
@@ -60,6 +67,39 @@ def get_vectorstore() -> Chroma:
             collection_metadata=COLLECTION_METADATA,
         )
     return _vectorstore
+
+
+def _load_manifest() -> dict[str, dict]:
+    """读取 manifest 的 documents 字段；文件缺失或损坏时返回空字典。"""
+    try:
+        with MANIFEST_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        docs = data.get("documents") if isinstance(data, dict) else None
+        return docs if isinstance(docs, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_manifest(documents: dict[str, dict]) -> None:
+    """原子写入 manifest（失败不阻断入库）。"""
+    try:
+        MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = MANIFEST_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump({"version": 1, "documents": documents}, f, ensure_ascii=False, indent=2)
+        tmp.replace(MANIFEST_PATH)
+    except OSError:
+        pass
+
+
+def content_hash(text: str) -> str:
+    """计算文档内容哈希（用于判断内容是否变化）。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def get_manifest_entry(filename: str) -> dict | None:
+    """获取单个文档的 manifest 记录（不存在返回 None）。"""
+    return _load_manifest().get(filename)
 
 
 def _make_splitter() -> RecursiveCharacterTextSplitter:
@@ -97,7 +137,19 @@ def ingest_document(text: str, filename: str) -> int:
         return 0
 
     vs = get_vectorstore()
+    # 先按 source 删除旧数据，再写入新数据：
+    # 同一文件重复入库不会产生重复片段，文件内容变化后也不会残留旧内容。
+    delete_document(filename)
     vs.add_documents(docs)
+
+    # 记录内容哈希与切片数，供导入脚本判断是否需要重建
+    manifest = _load_manifest()
+    manifest[filename] = {
+        "content_hash": content_hash(text),
+        "chunk_count": len(docs),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _save_manifest(manifest)
     return len(docs)
 
 
@@ -201,6 +253,8 @@ def clear_knowledge_base() -> dict:
             )
         except Exception:
             _vectorstore = None
+        # 清空 manifest，避免残留已删除文档的哈希记录
+        _save_manifest({})
 
     # 5. 成功清空后，仅删除「快照里的旧 segment 目录」（新目录不在快照中，不会被误删）。
     #    chroma.sqlite3 被运行中的进程锁定，保持不动（其中已无业务数据，不影响正确性）。
@@ -243,6 +297,12 @@ def delete_document(filename: str) -> int:
     ids = (data or {}).get("ids") or []
     if ids:
         vs.delete(ids=ids)
+
+    # 同步清理 manifest 记录
+    manifest = _load_manifest()
+    if filename in manifest:
+        del manifest[filename]
+        _save_manifest(manifest)
     return len(ids)
 
 

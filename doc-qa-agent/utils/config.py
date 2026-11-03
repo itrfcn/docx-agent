@@ -46,7 +46,8 @@ class Config:
     )
 
     # ---- 切片 ----
-    chunk_size: int = field(default_factory=lambda: int(_env("CHUNK_SIZE", default="512")))  # type: ignore[assignment]
+    # 400 字左右更适合中文制度/流程文档，命中片段更聚焦；可通过环境变量调整
+    chunk_size: int = field(default_factory=lambda: int(_env("CHUNK_SIZE", default="400")))  # type: ignore[assignment]
     chunk_overlap: int = field(default_factory=lambda: int(_env("CHUNK_OVERLAP", default="64")))  # type: ignore[assignment]
 
     # ---- 检索 ----

@@ -142,13 +142,20 @@ with st.sidebar:
                 progress_bar = st.progress(0.0, text="准备入库...")
                 total = len(uploaded_files)
                 success_count = 0
+                existing = set(vectorstore.list_sources())
                 for idx, uf in enumerate(uploaded_files):
                     try:
                         raw = uf.read()
                         text = parsers.parse_file(raw, uf.name)
+                        # 同名覆盖：ingest_document 内部会先删除同名旧切片再写入，
+                        # 此处仅用于区分提示文案（解析成功后才写库，失败不影响已有数据）
+                        overwritten = uf.name in existing
                         chunks = vectorstore.ingest_document(text, uf.name)
                         success_count += 1
-                        st.success(f"✅ {uf.name} — 入库 {chunks} 个切片")
+                        if overwritten:
+                            st.success(f"🔁 {uf.name} — 已覆盖更新，{chunks} 个切片")
+                        else:
+                            st.success(f"✅ {uf.name} — 入库 {chunks} 个切片")
                     except parsers.DocParseError as e:
                         st.error(f"❌ {uf.name} — {e}")
                     except Exception as e:
@@ -308,8 +315,9 @@ if prompt:
         with st.spinner("🧠 思考中（知识库检索中,请耐心等待）..."):
             try:
                 answer = ask_agent(prompt, history_tuples)
-            except Exception as e:
-                answer = f"[系统错误] Agent 运行异常：{e}"
+            except Exception:
+                # 不把技术细节写进对话历史，只给用户友好提示
+                answer = "抱歉，当前无法完成回答，请稍后重试。"
 
         st.markdown(answer)
 

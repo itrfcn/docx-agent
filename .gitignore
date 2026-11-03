@@ -1,0 +1,52 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- 环境变量与密钥（务必不要提交）----
+.env
+.env.local
+.env.*.local
+.streamlit/secrets.toml
+
+# ---- 运行时生成的数据 ----
+data/chroma/
+data/manifest.json
+data/models/
+*.sqlite3
+*.db
+*.log
+
+# ---- 测试临时文件 ----
+~$*
+*.tmp
+.screenshots/
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 缓存 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/

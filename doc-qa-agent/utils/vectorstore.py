@@ -22,6 +22,9 @@ from utils.config import cfg
 # Chroma collection 名称（业务隔离）
 COLLECTION_NAME = "enterprise_docs"
 
+# bge 官方约定：查询向量需加检索指令前缀（文档侧不加），可提升召回率
+QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
 # 全局单例向量库实例（延迟初始化）
 _vectorstore: Chroma | None = None
 _embedding: HuggingFaceEmbeddings | None = None
@@ -186,8 +189,22 @@ def clear_knowledge_base() -> dict:
         except Exception:
             _vectorstore = None
 
-    # 5. 仅在 collection 清理失败时兜底尝试删文件，且容错处理占用异常
+    # 5. 成功清空后，尽力删除无引用的孤儿文件（如已废弃的 HNSW 段索引）。
+    #    chroma.sqlite3 通常被运行中的进程锁定，跳过（其中已无业务数据，不影响正确性）。
     leftover = False
+    if cleared:
+        for child in cfg.chroma_persist_dir.glob("*"):
+            if child.name.startswith("chroma.sqlite3"):
+                continue
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            except OSError:
+                leftover = True
+
+    # 6. 仅在 collection 清理失败时兜底尝试删文件，且容错处理占用异常
     if not cleared:
         leftover = _try_remove_persist_files()
         if not leftover:
@@ -202,7 +219,8 @@ def clear_knowledge_base() -> dict:
 def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     """
     根据 query 做相似度检索，返回 LangChain Document 列表。
+    查询侧附加 bge 检索指令前缀（文档入库时不含前缀）。
     """
     k = top_k or cfg.retriever_top_k
     vs = get_vectorstore()
-    return vs.similarity_search(query, k=k)
+    return vs.similarity_search(f"{QUERY_INSTRUCTION}{query}", k=k)

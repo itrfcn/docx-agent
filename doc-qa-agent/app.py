@@ -10,8 +10,16 @@ Streamlit 主程序
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# bge 模型已完整缓存到本地：开启 HF 离线模式，跳过联网检查与重试，
+# 避免启动时因无法访问 huggingface.co 反复超时（需在导入 HF 相关库前设置）。
+# 若以后要下载新模型：注释掉下一行，即自动走 HF_ENDPOINT 国内镜像下载。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 import streamlit as st  # noqa: E402
 

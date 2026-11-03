@@ -22,6 +22,7 @@ from pathlib import Path
 
 # 国内网络可走 HuggingFace 镜像（已存在该环境变量时不覆盖）
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -42,9 +43,11 @@ def _source_name(path: Path) -> str:
 
 
 def _iter_doc_files(root: Path) -> list[Path]:
-    """递归收集受支持的文档文件。"""
+    """递归收集受支持的文档文件（跳过 Word 临时锁文件 ~$xxx）。"""
     files: list[Path] = []
     for p in sorted(root.rglob("*")):
+        if p.name.startswith("~$"):
+            continue
         if p.is_file() and p.suffix.lower().lstrip(".") in parsers.SUPPORTED_EXTENSIONS:
             files.append(p)
     return files

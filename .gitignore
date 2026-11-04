@@ -25,6 +25,7 @@ ENV/
 **/data/manifest.json
 **/data/models/
 **/data/docs/
+**/static/preview/
 *.sqlite3
 *.db
 *.log

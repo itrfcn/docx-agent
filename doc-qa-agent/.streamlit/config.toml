@@ -1,0 +1,3 @@
+[server]
+# 允许通过 /app/static/... 访问 static 目录下的文件（用于浏览器 PDF 预览）
+enableStaticServing = true

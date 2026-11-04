@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import os
 import subprocess
 import sys
@@ -35,6 +36,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from utils import parsers, vectorstore  # noqa: E402
 from utils.agent import ask_agent, get_last_sources  # noqa: E402
 from utils.config import cfg  # noqa: E402
+from utils.preview import html_preview_url, pdf_preview_url, read_text  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +94,90 @@ def _location_label(src: dict) -> str:
     return ""
 
 
+def _preview_html(path: Path, entry: dict) -> tuple[str, str]:
+    """
+    生成浏览器预览内容：引用位置附近的原文（HTML，命中片段高亮）。
+
+    Returns:
+        (html 片段, 位置说明)
+    """
+    text = read_text(path)
+    snippet = str(entry.get("snippet") or "")
+
+    if entry.get("page"):
+        pages = text.split("\f")
+        page = int(entry["page"])
+        idx = min(max(page - 1, 0), len(pages) - 1)
+        body = pages[idx].strip()
+        note = f"第 {page} 页"
+    else:
+        line = int(entry.get("line") or 1)
+        lines = text.splitlines()
+        start = max(line - 3, 1)
+        body = "\n".join(lines[start - 1 : start + 40])
+        note = f"第 {line} 行起（展示附近原文）"
+
+    escaped = html.escape(body)
+    if snippet:
+        escaped_snippet = html.escape(snippet)
+        escaped = escaped.replace(escaped_snippet, f"<mark>{escaped_snippet}</mark>")
+
+    css = (
+        "white-space:pre-wrap;line-height:1.7;font-size:0.92rem;"
+        "background:#fafafa;border:1px solid #e6e6e6;border-radius:8px;"
+        "padding:14px;max-height:60vh;overflow:auto;"
+    )
+    return f"<div style=\"{css}\">{escaped}</div>", note
+
+
+@st.dialog("浏览原文", width="large")
+def _show_preview(name: str, entry: dict) -> None:
+    """浏览器内预览：展示引用位置附近的原文，并高亮命中片段。"""
+    path = _resolve_doc_file(name)
+    if path is None:
+        st.error("原始文件不存在或已被删除。")
+        return
+
+    st.caption(f"{name} · {_location_label(entry)}")
+
+    # 浏览器直接预览：Word 文档在服务端转成 PDF（带页码锚点）在新标签页打开；
+    # 若文件被企业加密导致 PDF 不可读，则提供网页全文预览（自动定位并高亮）
+    url = pdf_preview_url(path, entry)
+    html_url = html_preview_url(path, entry)
+    if url:
+        st.link_button("🌐 在新标签页打开 PDF（版式与原文件一致）", url=url, type="primary")
+    if html_url:
+        st.link_button(
+            "🌐 在新标签页查看全文（网页版，自动定位）",
+            url=html_url,
+            type="secondary" if url else "primary",
+        )
+    if not url and html_url:
+        st.caption("该文件受企业加密保护，无法生成 PDF，已提供网页全文预览。")
+    elif not url and not html_url:
+        st.info("无法生成浏览器预览，请使用下方文本预览或下载原文件。")
+
+    try:
+        body, note = _preview_html(path, entry)
+    except Exception as e:
+        st.error(f"无法解析文件：{e}")
+        body = None
+    if body:
+        st.markdown(
+            "<style>mark{background:#fff3a0;padding:0 2px;}</style>",
+            unsafe_allow_html=True,
+        )
+        st.caption(note)
+        st.markdown(body, unsafe_allow_html=True)
+
+    st.download_button(
+        "⬇️ 下载原文件",
+        data=path.read_bytes(),
+        file_name=path.name,
+        key=f"download_{name}_{entry.get('page') or entry.get('line') or 0}",
+    )
+
+
 def _render_source_actions(sources: list[dict], key_prefix: str) -> None:
     """在回答下方渲染来源文件的操作按钮（仅对磁盘上真实存在的文件显示）。"""
     rows = [(s, _resolve_doc_file(s.get("name", ""))) for s in sources or []]
@@ -99,10 +185,15 @@ def _render_source_actions(sources: list[dict], key_prefix: str) -> None:
     if not rows:
         return
 
-    st.caption("原始文件（点击可打开并定位到引用处）")
+    st.caption("原始文件（可在浏览器查看引用处，或在本机打开）")
     for i, (src, path) in enumerate(rows):
-        col_open, col_locate = st.columns([0.72, 0.28])
-        label = f"📄 {src['name']} · {_location_label(src)}"
+        col_browse, col_open, col_locate = st.columns([0.34, 0.5, 0.16])
+        loc = _location_label(src)
+        label = f"📄 {src['name']}" + (f" · {loc}" if loc else "")
+        if col_browse.button(
+            "🌐 浏览器查看", key=f"{key_prefix}_view_{i}", help="在当前页面查看原文并定位到引用处"
+        ):
+            _show_preview(src["name"], src)
         if col_open.button(label, key=f"{key_prefix}_open_{i}", help=str(path)):
             _open_at_location(path, src)
         if col_locate.button("📁 定位", key=f"{key_prefix}_loc_{i}", help="在资源管理器中选中该文件"):

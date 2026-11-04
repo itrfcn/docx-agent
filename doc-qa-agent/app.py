@@ -13,7 +13,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import subprocess
 import sys
+import webbrowser
 from pathlib import Path
 
 # bge 模型已完整缓存到本地：开启 HF 离线模式，跳过联网检查与重试，
@@ -31,8 +33,80 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from utils import parsers, vectorstore  # noqa: E402
-from utils.agent import ask_agent  # noqa: E402
+from utils.agent import ask_agent, get_last_sources  # noqa: E402
 from utils.config import cfg  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# 来源文件操作：打开原始文件 / 在资源管理器中定位
+# ---------------------------------------------------------------------------
+def _resolve_doc_file(name: str) -> Path | None:
+    """把来源文件名解析为 docs 目录内的真实文件；越界或不存在返回 None。"""
+    base = cfg.docs_dir.resolve()
+    path = (base / name).resolve()
+    try:
+        path.relative_to(base)  # 防止 ../ 之类越出文档目录
+    except ValueError:
+        return None
+    return path if path.is_file() else None
+
+
+def _open_at_location(path: Path, entry: dict) -> None:
+    """打开原始文件并定位到引用位置：PDF 跳到对应页码，其余用 Word 定位到原文片段。"""
+    if entry.get("page"):
+        webbrowser.open(f"file:///{path.as_posix()}#page={entry['page']}")
+        return
+
+    try:
+        import pythoncom
+        import win32com.client as win32
+    except ImportError:
+        os.startfile(str(path))
+        return
+
+    pythoncom.CoInitialize()
+    try:
+        word = win32.DispatchEx("Word.Application")
+        word.Visible = True
+        word.DisplayAlerts = 0
+        document = word.Documents.Open(str(path), ReadOnly=True, AddToRecentFiles=False)
+
+        snippet = entry.get("snippet") or ""
+        if snippet:
+            target = document.Content
+            if target.Find.Execute(FindText=snippet, Forward=True, Wrap=1):  # 1 = wdFindContinue
+                target.Select()
+                word.Activate()
+    except Exception as e:
+        st.warning(f"已打开文件，但无法定位到引用位置：{e}")
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def _location_label(src: dict) -> str:
+    """来源定位的简短说明。"""
+    if src.get("page"):
+        return f"第 {src['page']} 页"
+    if src.get("line"):
+        return f"第 {src['line']} 行起"
+    return ""
+
+
+def _render_source_actions(sources: list[dict], key_prefix: str) -> None:
+    """在回答下方渲染来源文件的操作按钮（仅对磁盘上真实存在的文件显示）。"""
+    rows = [(s, _resolve_doc_file(s.get("name", ""))) for s in sources or []]
+    rows = [(s, p) for s, p in rows if p is not None]
+    if not rows:
+        return
+
+    st.caption("原始文件（点击可打开并定位到引用处）")
+    for i, (src, path) in enumerate(rows):
+        col_open, col_locate = st.columns([0.72, 0.28])
+        label = f"📄 {src['name']} · {_location_label(src)}"
+        if col_open.button(label, key=f"{key_prefix}_open_{i}", help=str(path)):
+            _open_at_location(path, src)
+        if col_locate.button("📁 定位", key=f"{key_prefix}_loc_{i}", help="在资源管理器中选中该文件"):
+            subprocess.Popen(["explorer", "/select,", str(path)])
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +207,7 @@ with st.sidebar:
             "上传文档（可多选）",
             type=list(parsers.SUPPORTED_EXTENSIONS),
             accept_multiple_files=True,
-            help="支持 PDF / DOCX / TXT，不支持扫描件（无 OCR）。",
+            help="支持 PDF / DOCX / DOC / TXT，不支持扫描件（无 OCR）。.doc 需本机装有 Word。",
         )
 
         if uploaded_files:
@@ -147,6 +221,11 @@ with st.sidebar:
                     try:
                         raw = uf.read()
                         text = parsers.parse_file(raw, uf.name)
+                        # 原始文件落盘（解析成功后才保存，避免留下损坏文件）；
+                        # 仅取文件名，忽略路径成分，防止路径穿越
+                        safe_name = Path(uf.name).name
+                        cfg.docs_dir.mkdir(parents=True, exist_ok=True)
+                        (cfg.docs_dir / safe_name).write_bytes(raw)
                         # 同名覆盖：ingest_document 内部会先删除同名旧切片再写入，
                         # 此处仅用于区分提示文案（解析成功后才写库，失败不影响已有数据）
                         overwritten = uf.name in existing
@@ -288,9 +367,11 @@ if "messages" not in st.session_state:
     st.session_state.messages = []  # list of {"role": ..., "content": ...}
 
 # 渲染历史消息
-for msg in st.session_state.messages:
+for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        if msg.get("sources"):
+            _render_source_actions(msg["sources"], f"hist{idx}")
 
 # 聊天输入框
 prompt = st.chat_input("请输入问题（如：差旅报销的审批流程是什么？）")
@@ -318,10 +399,14 @@ if prompt:
             except Exception:
                 # 不把技术细节写进对话历史，只给用户友好提示
                 answer = "抱歉，当前无法完成回答，请稍后重试。"
+            hit_sources = get_last_sources()
 
         st.markdown(answer)
+        _render_source_actions(hit_sources, "live")
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer, "sources": hit_sources}
+    )
 
 # 底部提示
 st.caption(

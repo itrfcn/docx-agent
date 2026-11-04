@@ -1,14 +1,14 @@
 """
 本地文件夹批量导入
 ------------------
-用途：企业环境无法使用网页上传时，把 PDF/DOCX/TXT 放进 data/docs 目录，
+用途：企业环境无法使用网页上传时，把 PDF/DOCX/DOC/TXT 放进 data/docs 目录，
       执行本脚本即可批量入库（复用 解析 → 切片 → embedding → Chroma 写入 链路）。
 
 用法：
     python import_docs.py
 
 规则：
-    - 递归扫描 data/docs 下的 pdf / docx / txt
+    - 递归扫描 data/docs 下的 pdf / docx / doc / txt
     - 已入库且内容未变化的文件自动跳过（manifest 中的 content_hash 一致）
     - 内容变化的文件自动「先删旧数据再重建」，避免重复片段与旧内容残留
     - 单个文件失败不影响其余文件

@@ -37,6 +37,19 @@ MANIFEST_PATH = cfg.chroma_persist_dir.parent / "manifest.json"
 # bge 官方约定：查询向量需加检索指令前缀（文档侧不加），可提升召回率
 QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 
+# 项目根目录（用于把文档路径转换成相对展示位置）
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def source_path(filename: str) -> str:
+    """原始文件的展示位置：相对项目根目录、POSIX 分隔（如 data/docs/xxx.pdf）。"""
+    p = cfg.docs_dir / filename
+    try:
+        return p.relative_to(_PROJECT_ROOT).as_posix()
+    except ValueError:
+        return p.as_posix()
+
+
 # 全局单例向量库实例（延迟初始化）
 _vectorstore: Chroma | None = None
 _embedding: HuggingFaceEmbeddings | None = None
@@ -111,27 +124,63 @@ def _make_splitter() -> RecursiveCharacterTextSplitter:
     )
 
 
+def _make_snippet(content: str, size: int = 20) -> str:
+    """
+    取出用于在 Word 中定位原文的片段。
+
+    必须保留原文中的空格（Word 的查找是精确匹配，去掉空格会找不到），
+    同时不能跨行（跨段落/换行在 Word 里不是连续字符串）。
+    """
+    for line in content.splitlines():
+        text = line.strip()
+        if len(text) >= 12:
+            return text[:size]
+    return content.strip()[:size]
+
+
 def ingest_document(text: str, filename: str) -> int:
     """
     将单个文档文本切片后入库。
 
     Args:
-        text:     文档完整文本
+        text:     文档完整文本（PDF 以 \f 表示分页边界）
         filename: 文档原始文件名（存为 metadata，用于引用）
 
     Returns:
         成功入库的切片数量
+
+    每个切片除 source 外，还记录定位信息：
+        - PDF：page（页码）
+        - 其它：line（行号）+ snippet（用于在 Word 中定位的文本片段）
     """
     splitter = _make_splitter()
-    chunks = splitter.split_text(text)
+    chunk_texts = splitter.split_text(text)
+    is_pdf = "\f" in text
 
-    docs = [
-        Document(
-            page_content=chunk,
-            metadata={"source": filename},
-        )
-        for chunk in chunks
-    ]
+    docs: list[Document] = []
+    cursor = 0
+    for chunk in chunk_texts:
+        content = chunk.strip()
+        if not content:
+            continue
+
+        # 定位切片在原文中的起始偏移（切片是原文的连续片段，按顺序向后查找即可）
+        start = text.find(chunk, cursor)
+        if start < 0:
+            start = text.find(chunk)
+        if start < 0:
+            start = cursor
+        cursor = start + len(chunk)
+
+        meta: dict = {"source": filename}
+        if is_pdf:
+            meta["page"] = text[:start].count("\f") + 1
+            content = content.replace("\f", "\n").strip()
+        else:
+            meta["line"] = text[:start].count("\n") + 1
+        meta["snippet"] = _make_snippet(content)
+
+        docs.append(Document(page_content=content, metadata=meta))
 
     if not docs:
         return 0

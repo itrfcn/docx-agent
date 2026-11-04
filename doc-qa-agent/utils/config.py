@@ -45,6 +45,11 @@ class Config:
         default_factory=lambda: Path(_env("CHROMA_PERSIST_DIR", default="./data/chroma")).resolve()
     )
 
+    # ---- 原始文档目录（上传文件落盘于此，回答中据此给出文件位置）----
+    docs_dir: Path = field(
+        default_factory=lambda: Path(_env("DOCS_DIR", default="./data/docs")).resolve()
+    )
+
     # ---- 切片 ----
     # 400 字左右更适合中文制度/流程文档，命中片段更聚焦；可通过环境变量调整
     chunk_size: int = field(default_factory=lambda: int(_env("CHUNK_SIZE", default="400")))  # type: ignore[assignment]
@@ -73,6 +78,7 @@ class Config:
     def ensure_dirs(self) -> None:
         """确保所有需要的目录存在。"""
         self.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
+        self.docs_dir.mkdir(parents=True, exist_ok=True)
 
 
 # 单例

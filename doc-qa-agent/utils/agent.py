@@ -7,6 +7,7 @@ Agent 模块
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from langchain.agents import create_react_agent, AgentExecutor
@@ -26,6 +27,33 @@ from prompts.system_prompt import SYSTEM_PROMPT
 # ---------------------------------------------------------------------------
 # 1. 知识库检索工具（唯一工具）
 # ---------------------------------------------------------------------------
+# 本轮问答命中的来源文件（线程本地：Streamlit 每个会话独立线程，互不干扰）
+_source_ctx = threading.local()
+
+
+def _record_source(doc: Any) -> None:
+    """记录本轮检索命中的文档及其定位信息（同一文件只记第一次命中的位置）。"""
+    meta: dict = dict(getattr(doc, "metadata", {}) or {})
+    source = meta.get("source", "未知来源")
+    items: list[dict] = getattr(_source_ctx, "items", []) or []
+    if any(i["name"] == source for i in items):
+        return
+
+    entry: dict = {"name": source, "path": vectorstore.source_path(source)}
+    if meta.get("page"):
+        entry["page"] = int(meta["page"])
+    else:
+        entry["line"] = int(meta.get("line") or 0)
+        entry["snippet"] = str(meta.get("snippet") or "")
+    items.append(entry)
+    _source_ctx.items = items
+
+
+def get_last_sources() -> list[dict]:
+    """返回最近一次 ask_agent 命中的来源文件列表：{"name": ..., "path": ...}。"""
+    return list(getattr(_source_ctx, "items", []) or [])
+
+
 @tool
 def knowledge_search(query: str) -> str:
     """在企业内部文档知识库中检索与问题相关的文档片段。
@@ -40,7 +68,7 @@ def knowledge_search(query: str) -> str:
     if not docs:
         return "知识库中未检索到相关片段（可能没有相关资料）。"
 
-    # 去重（按内容）并格式化，附带来源
+    # 去重（按内容）并格式化，附带来源文件名与原始文件位置
     seen: set[str] = set()
     parts: list[str] = []
     for doc in docs:
@@ -49,7 +77,8 @@ def knowledge_search(query: str) -> str:
             continue
         seen.add(content)
         source = doc.metadata.get("source", "未知来源")
-        parts.append(f"[{source}]\n{content}")
+        _record_source(doc)
+        parts.append(f"[{source}]（文件位置：{vectorstore.source_path(source)}）\n{content}")
 
     if not parts:
         return "知识库中未检索到相关片段（可能没有相关资料）。"
@@ -232,15 +261,18 @@ def _direct_answer(question: str) -> str:
         return "抱歉，知识库中暂未检索到与该问题相关的资料，无法回答该问题。" + _DISCLAIMER
 
     context_parts: list[str] = []
-    source_names: list[str] = []
+    source_labels: list[str] = []
     for doc in docs:
         source = doc.metadata.get("source", "未知来源")
         content = (doc.page_content or "").strip()
         if not content:
             continue
-        context_parts.append(f"[{source}]\n{content}")
-        if source not in source_names:
-            source_names.append(source)
+        path = vectorstore.source_path(source)
+        _record_source(doc)
+        context_parts.append(f"[{source}]（文件位置：{path}）\n{content}")
+        label = f"{source}（{path}）"
+        if label not in source_labels:
+            source_labels.append(label)
 
     if not context_parts:
         return "抱歉，知识库中暂未检索到与该问题相关的资料，无法回答该问题。" + _DISCLAIMER
@@ -250,7 +282,7 @@ def _direct_answer(question: str) -> str:
             "system",
             "你是企业内部文档问答助手。只能依据用户提供的资料回答；"
             "资料不足时必须明确说明未检索到相关资料，严禁编造制度、流程或数据。"
-            "用简洁中文分点陈述，每个结论后用【来源：文件名】标注来源。",
+            "用简洁中文分点陈述，每个结论后用【来源：文件名（文件位置：data/docs/xxx）】标注来源和原始文件位置。",
         ),
         ("human", "问题：{question}\n\n资料：\n{context}"),
     ])
@@ -266,7 +298,7 @@ def _direct_answer(question: str) -> str:
         return "抱歉，当前无法完成回答，请稍后重试。" + _DISCLAIMER
 
     if "【来源" not in answer and "【引用来源" not in answer:
-        answer += f"\n\n【引用来源：{'、'.join(source_names)}】"
+        answer += f"\n\n【引用来源：{'、'.join(source_labels)}】"
     if "本工具仅作辅助参考" not in answer:
         answer += _DISCLAIMER
     return answer
@@ -284,6 +316,7 @@ def ask_agent(user_question: str, chat_history: list[tuple[str, str]] | None = N
         Agent 最终回复文本（任何异常都会降级为友好中文答复，不返回技术报错）
     """
     executor = get_agent_executor()
+    _source_ctx.items = []  # 重置本轮来源记录
 
     # LangChain 的 chat_history 使用 BaseMessage 序列
     from langchain_core.messages import HumanMessage, AIMessage

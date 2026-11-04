@@ -32,19 +32,27 @@ _source_ctx = threading.local()
 
 
 def _record_source(doc: Any) -> None:
-    """记录本轮检索命中的文档及其定位信息（同一文件只记第一次命中的位置）。"""
+    """记录本轮检索命中的文档位置（同一文件的多个不同位置都会保留）。"""
     meta: dict = dict(getattr(doc, "metadata", {}) or {})
     source = meta.get("source", "未知来源")
-    items: list[dict] = getattr(_source_ctx, "items", []) or []
-    if any(i["name"] == source for i in items):
-        return
 
-    entry: dict = {"name": source}
     if meta.get("page"):
-        entry["page"] = int(meta["page"])
+        loc = {"page": int(meta["page"])}
     else:
-        entry["line"] = int(meta.get("line") or 0)
-        entry["snippet"] = str(meta.get("snippet") or "")
+        loc = {
+            "line": int(meta.get("line") or 0),
+            "snippet": str(meta.get("snippet") or ""),
+        }
+    entry: dict = {"name": source, **loc}
+
+    items: list[dict] = getattr(_source_ctx, "items", []) or []
+    # 同一文件、同一位置只记一次（按位置去重，而非按文件名去重）
+    for item in items:
+        if item.get("name") == source and {
+            k: v for k, v in item.items() if k != "name"
+        } == loc:
+            return
+
     items.append(entry)
     _source_ctx.items = items
 

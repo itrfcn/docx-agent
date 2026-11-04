@@ -401,8 +401,8 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     - 使用 similarity_search_with_relevance_scores 取带分数结果（要求 cosine 空间）
     - 低于 cfg.relevance_threshold 的片段直接丢弃；全部低于阈值时返回空列表，
       由调用方明确告知「未检索到相关片段」，避免硬凑无关内容
-    - 按**来源**去重：每个文档最多保留 1 个片段（过量取 2 倍候选再过滤），
-      避免 top_k 名额被同一文件占用，保证返回结果覆盖更多文档
+    - 同一来源最多保留 2 个片段：既保留同一文件的多个引用位置（供前端逐个定位），
+      又避免单个文件占满 top_k 名额，保证结果覆盖更多文档
     """
     k = top_k or cfg.retriever_top_k
     threshold = cfg.relevance_threshold
@@ -432,13 +432,20 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     # 相关性阈值过滤
     candidates = [doc for doc, score in scored if score is None or score >= threshold]
 
-    seen_sources: set[str] = set()
+    # 同一文件最多保留 2 片（保留多个引用位置），并按内容去重
+    max_per_source = 2
+    per_source: dict[str, int] = {}
+    seen_contents: set[str] = set()
     unique: list[Document] = []
     for doc in candidates:
-        source = doc.metadata.get("source", "")
-        if source in seen_sources:
+        content = doc.page_content or ""
+        if not content or content in seen_contents:
             continue
-        seen_sources.add(source)
+        source = doc.metadata.get("source", "")
+        if per_source.get(source, 0) >= max_per_source:
+            continue
+        seen_contents.add(content)
+        per_source[source] = per_source.get(source, 0) + 1
         unique.append(doc)
         if len(unique) >= k:
             break

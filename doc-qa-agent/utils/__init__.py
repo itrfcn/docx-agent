@@ -17,3 +17,11 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 # 关闭 Chroma 匿名遥测：离线环境上报必然失败，只会刷无害报错日志
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
+# 环境变量在部分 chromadb 版本中未生效。posthog 7.x 的 capture() 签名与
+# chromadb 0.5.x 不兼容（"capture() takes 1 positional argument but 3 were given"），
+# 且该 TypeError 发生在函数参数绑定阶段，posthog.disabled 也挡不住。
+# 遥测上报本就必然失败（离线环境），这里直接屏蔽该模块的日志输出。
+import logging
+
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)

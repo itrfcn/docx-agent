@@ -10,6 +10,9 @@ from __future__ import annotations
 from typing import Any
 
 from langchain.agents import create_react_agent, AgentExecutor
+from langchain.agents.output_parsers import ReActSingleInputOutputParser
+from langchain_core.agents import AgentFinish
+from langchain_core.exceptions import OutputParserException
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -61,6 +64,41 @@ _agent_executor: AgentExecutor | None = None
 _llm: ChatOpenAI | None = None
 
 
+class _LenientReActParser(ReActSingleInputOutputParser):
+    """
+    宽松版 ReAct 解析器。
+
+    背景：部分模型习惯直接给出答案正文而漏写 "Final Answer:" 前缀，
+    标准解析器会抛 OutputParserException，导致白白多跑一轮 LLM 调用。
+
+    策略：
+    - 正常格式 → 交由标准解析器处理（行为完全不变）；
+    - 解析失败，但文本里**没有** Action 意图、且内容足够长 → 直接视为最终答案；
+    - 其余情况（想调工具却格式混乱、输出过短）→ 继续抛异常走纠正重试。
+    """
+
+    _MIN_ANSWER_LEN = 20
+    # 以这些字符结尾说明输出被截断/未写完，不能当作完整答案
+    _INCOMPLETE_ENDINGS = ("，", ",", "、", "：", ":", "（", "(", "【", "…")
+
+    def parse(self, text: str):
+        try:
+            return super().parse(text)
+        except OutputParserException:
+            body = (text or "").strip()
+            # 出现 Action 说明模型仍想调用工具，只是格式乱了，需要纠正后重试
+            if "Action:" in body or "Action Input:" in body:
+                raise
+            if len(body) < self._MIN_ANSWER_LEN:
+                raise
+            if body.endswith(self._INCOMPLETE_ENDINGS):
+                raise
+            # 去掉可能残留的 "Thought:" 前缀，保留正文
+            if body.startswith("Thought:"):
+                body = body[len("Thought:"):].lstrip()
+            return AgentFinish(return_values={"output": body}, log=text)
+
+
 def _get_llm() -> ChatOpenAI:
     """LLM 单例：60 秒超时 + 2 次重试，避免单次请求长时间卡住。"""
     global _llm
@@ -104,7 +142,12 @@ def get_agent_executor() -> AgentExecutor:
         ("human", "{input}\n\nThought:{agent_scratchpad}"),
     ])
 
-    agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
+    agent = create_react_agent(
+        llm=llm,
+        tools=tools,
+        prompt=prompt,
+        output_parser=_LenientReActParser(),   # 漏写 Final Answer 前缀时直接采纳正文
+    )
 
     _agent_executor = AgentExecutor(
         agent=agent,
@@ -117,7 +160,8 @@ def get_agent_executor() -> AgentExecutor:
         max_iterations=10,         # 防止死循环，允许 10 轮检索内收敛
         max_execution_time=120,    # 整体执行超时（秒），超时后进入降级直答
         # 注：当前 langchain 版本仅支持 early_stopping_method="force"（默认），不可用 "generate"
-        return_intermediate_steps=False,
+        # 需要中间步骤来判断「是否真正调用过检索工具」（硬性规则见 _needs_force_retrieval）
+        return_intermediate_steps=True,
     )
     return _agent_executor
 
@@ -132,6 +176,45 @@ def _is_degraded_answer(text: str) -> bool:
     """识别 ReAct 未正常收敛的情况（迭代/时间耗尽、空输出）。"""
     t = (text or "").strip().lower()
     return (not t) or ("iteration limit" in t) or ("time limit" in t) or ("agent stopped" in t)
+
+
+# 明确声明“资料不足”的说法：这类回答不需要来源标注
+_REFUSAL_HINTS = ("暂无相关", "未检索到", "没有相关", "无法回答")
+
+
+def _looks_grounded(text: str) -> bool:
+    """
+    判断答案是否基于知识库。
+
+    宽松解析器会直接采纳缺少 "Final Answer:" 前缀的回答，存在一种风险：
+    模型没检索就凭常识作答。这里用两点兜底：
+    - 带来源标注（【来源 / 【引用来源）→ 视为有依据；
+    - 明确声明资料不足 → 视为合规回答。
+    都没有且篇幅较长（≥40 字，排除闲聊短句）→ 判为无依据，转强制检索直答。
+    """
+    if "【来源" in text or "【引用来源" in text:
+        return True
+    if any(hint in text for hint in _REFUSAL_HINTS):
+        return True
+    return len(text.strip()) < 40
+
+
+def _needs_force_retrieval(answer: str, steps: list) -> bool:
+    """
+    硬性规则：实质性回答必须建立在一次真实检索之上。
+
+    - 迭代/时间耗尽、空输出 → 需兜底；
+    - 无来源标注、非明确拒答的长答案 → 需兜底；
+    - 有来源标注但整轮**从未调用过检索工具** → 来源可能是编造的，需兜底。
+    命中后由 _direct_answer 执行「检索 + 基于资料作答」。
+    """
+    if _is_degraded_answer(answer):
+        return True
+    if not _looks_grounded(answer):
+        return True
+    if not steps and len(answer.strip()) >= 40:
+        return True
+    return False
 
 
 def _direct_answer(question: str) -> str:
@@ -210,16 +293,18 @@ def ask_agent(user_question: str, chat_history: list[tuple[str, str]] | None = N
         lc_history.append(HumanMessage(content=human_msg))
         lc_history.append(AIMessage(content=ai_msg))
 
+    steps: list = []
     try:
         result = executor.invoke({
             "input": user_question,
             "chat_history": lc_history,
         })
         answer = str(result.get("output", "")).strip()
+        steps = result.get("intermediate_steps") or []
     except Exception:
         # 超时 / 限流 / 解析失败等：不把英文技术报错暴露给用户
         answer = ""
 
-    if _is_degraded_answer(answer):
+    if _needs_force_retrieval(answer, steps):
         answer = _direct_answer(user_question)
     return answer

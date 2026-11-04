@@ -39,7 +39,7 @@ def _record_source(doc: Any) -> None:
     if any(i["name"] == source for i in items):
         return
 
-    entry: dict = {"name": source, "path": vectorstore.source_path(source)}
+    entry: dict = {"name": source}
     if meta.get("page"):
         entry["page"] = int(meta["page"])
     else:
@@ -50,7 +50,7 @@ def _record_source(doc: Any) -> None:
 
 
 def get_last_sources() -> list[dict]:
-    """返回最近一次 ask_agent 命中的来源文件列表：{"name": ..., "path": ...}。"""
+    """返回最近一次 ask_agent 命中的来源文件列表：{"name": ..., "page"|"line": ...}。"""
     return list(getattr(_source_ctx, "items", []) or [])
 
 
@@ -68,7 +68,7 @@ def knowledge_search(query: str) -> str:
     if not docs:
         return "知识库中未检索到相关片段（可能没有相关资料）。"
 
-    # 去重（按内容）并格式化，附带来源文件名与原始文件位置
+    # 去重（按内容）并格式化，附带来源文件名
     seen: set[str] = set()
     parts: list[str] = []
     for doc in docs:
@@ -78,7 +78,7 @@ def knowledge_search(query: str) -> str:
         seen.add(content)
         source = doc.metadata.get("source", "未知来源")
         _record_source(doc)
-        parts.append(f"[{source}]（文件位置：{vectorstore.source_path(source)}）\n{content}")
+        parts.append(f"[{source}]\n{content}")
 
     if not parts:
         return "知识库中未检索到相关片段（可能没有相关资料）。"
@@ -267,12 +267,10 @@ def _direct_answer(question: str) -> str:
         content = (doc.page_content or "").strip()
         if not content:
             continue
-        path = vectorstore.source_path(source)
         _record_source(doc)
-        context_parts.append(f"[{source}]（文件位置：{path}）\n{content}")
-        label = f"{source}（{path}）"
-        if label not in source_labels:
-            source_labels.append(label)
+        context_parts.append(f"[{source}]\n{content}")
+        if source not in source_labels:
+            source_labels.append(source)
 
     if not context_parts:
         return "抱歉，知识库中暂未检索到与该问题相关的资料，无法回答该问题。" + _DISCLAIMER
@@ -282,7 +280,7 @@ def _direct_answer(question: str) -> str:
             "system",
             "你是企业内部文档问答助手。只能依据用户提供的资料回答；"
             "资料不足时必须明确说明未检索到相关资料，严禁编造制度、流程或数据。"
-            "用简洁中文分点陈述，每个结论后用【来源：文件名（文件位置：data/docs/xxx）】标注来源和原始文件位置。",
+            "用简洁中文分点陈述，每个结论后用【来源：文件名】标注来源，只写文件名，不要附加文件路径。",
         ),
         ("human", "问题：{question}\n\n资料：\n{context}"),
     ])

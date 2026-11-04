@@ -45,7 +45,7 @@ class Config:
         default_factory=lambda: Path(_env("CHROMA_PERSIST_DIR", default="./data/chroma")).resolve()
     )
 
-    # ---- 原始文档目录（上传文件落盘于此，回答中据此给出文件位置）----
+    # ---- 原始文档目录（上传文件落盘于此，供前端打开并定位）----
     docs_dir: Path = field(
         default_factory=lambda: Path(_env("DOCS_DIR", default="./data/docs")).resolve()
     )

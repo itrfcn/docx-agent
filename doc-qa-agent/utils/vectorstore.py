@@ -355,6 +355,44 @@ def delete_document(filename: str) -> int:
     return len(ids)
 
 
+def _collection_count(vs: Chroma) -> int:
+    """集合内切片总数（读不到时返回 0）。"""
+    try:
+        return int(vs._collection.count())
+    except Exception:
+        return 0
+
+
+def _brute_force_search(query: str, k: int) -> list[tuple[Document, float]]:
+    """
+    兜底检索：不依赖 HNSW 索引，直接对全部切片算余弦相似度。
+
+    用于 HNSW 索引出现 hnswlib 异常（如 "ef or M is too small"）时，
+    数据量不大（几千切片内）时开销可接受，可保证问答不中断。
+    """
+    vs = get_vectorstore()
+    data = vs.get(include=["documents", "metadatas", "embeddings"])
+    ids = data.get("ids") or []
+    docs_raw = data.get("documents") or []
+    metas = data.get("metadatas") or []
+    vectors = data.get("embeddings")
+    if vectors is None or len(ids) == 0:
+        return []
+
+    q = get_embedding().embed_query(f"{QUERY_INSTRUCTION}{query}")
+
+    scored: list[tuple[Document, float]] = []
+    for i, vec in enumerate(vectors):
+        if vec is None:
+            continue
+        # 入库向量已归一化，余弦相似度等价于点积
+        score = float(sum(a * b for a, b in zip(q, vec)))
+        doc = Document(page_content=docs_raw[i] or "", metadata=dict(metas[i] or {}))
+        scored.append((doc, score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:k]
+
+
 def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     """
     根据 query 做相似度检索，返回 LangChain Document 列表。
@@ -370,13 +408,26 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     threshold = cfg.relevance_threshold
     vs = get_vectorstore()
 
+    # 候选数不能超过集合实际切片数，否则 hnswlib 会抛出
+    # "Cannot return the results in a contigious 2D array. Probably ef or M is too small"
+    want = k * 2
+    count = _collection_count(vs)
+    if count <= 0:
+        return []  # 空集合直接返回，避免 hnswlib 在空索引上崩溃
+    n_results = min(want, count)
+
+    scored: list[tuple[Document, float]]
     try:
-        scored: list[tuple[Document, float]] = vs.similarity_search_with_relevance_scores(
-            f"{QUERY_INSTRUCTION}{query}", k=k * 2
+        scored = vs.similarity_search_with_relevance_scores(
+            f"{QUERY_INSTRUCTION}{query}", k=n_results
         )
     except Exception:
-        # 兜底：极少数环境拿不到相关性分数时退回普通检索（不做阈值过滤）
-        scored = [(doc, 1.0) for doc in vs.similarity_search(f"{QUERY_INSTRUCTION}{query}", k=k * 2)]
+        try:
+            # 兜底 1：普通相似度检索（不带相关性分数）
+            scored = [(doc, 1.0) for doc in vs.similarity_search(f"{QUERY_INSTRUCTION}{query}", k=n_results)]
+        except Exception:
+            # 兜底 2：绕过 HNSW 索引，直接全量算相似度
+            scored = _brute_force_search(query, want)
 
     # 相关性阈值过滤
     candidates = [doc for doc, score in scored if score is None or score >= threshold]

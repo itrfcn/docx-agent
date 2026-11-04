@@ -14,7 +14,6 @@ import hashlib
 import hmac
 import html
 import os
-import subprocess
 import sys
 import webbrowser
 from pathlib import Path
@@ -24,6 +23,7 @@ from pathlib import Path
 # 若以后要下载新模型：注释掉下一行，即自动走 HF_ENDPOINT 国内镜像下载。
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")  # 彻底跳过联网超时检查（省 ~5-8 秒）
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 import streamlit as st  # noqa: E402
@@ -36,7 +36,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from utils import parsers, vectorstore  # noqa: E402
 from utils.agent import ask_agent, get_last_sources  # noqa: E402
 from utils.config import cfg  # noqa: E402
-from utils.preview import html_preview_url, pdf_preview_url, read_text  # noqa: E402
+from utils.preview import html_preview_url, pdf_preview_url, read_text, warmup_sources  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +140,12 @@ def _show_preview(name: str, entry: dict) -> None:
 
     st.caption(f"{name} · {_location_label(entry)}")
 
-    # 浏览器直接预览：Word 文档在服务端转成 PDF（带页码锚点）在新标签页打开；
-    # 若文件被企业加密导致 PDF 不可读，则提供网页全文预览（自动定位并高亮）
-    url = pdf_preview_url(path, entry)
-    html_url = html_preview_url(path, entry)
+    # spinner 保证即使 PDF 导出 / Word 冷启动要几百毫秒，
+    # 对话框本体也立刻弹出来，用户不会觉得"点了没反应"。
+    with st.spinner("加载预览中..."):
+        url = pdf_preview_url(path, entry)
+        html_url = html_preview_url(path, entry)
+
     if url:
         st.link_button("🌐 在新标签页打开 PDF（版式与原文件一致）", url=url, type="primary")
     if html_url:
@@ -179,25 +181,29 @@ def _show_preview(name: str, entry: dict) -> None:
 
 
 def _render_source_actions(sources: list[dict], key_prefix: str) -> None:
-    """在回答下方渲染来源文件的操作按钮（仅对磁盘上真实存在的文件显示）。"""
+    """
+    渲染回答下方的引用来源操作按钮。
+
+    只提供**远程用户也能用**的入口：浏览器预览、下载原文件。
+    本机打开 Word / 资源管理器定位属于服务器本地操作，对浏览器用户无意义，已注释。
+    """
     rows = [(s, _resolve_doc_file(s.get("name", ""))) for s in sources or []]
     rows = [(s, p) for s, p in rows if p is not None]
     if not rows:
         return
 
-    st.caption("原始文件（可在浏览器查看引用处，或在本机打开）")
+    st.caption("📎 引用来源（点击查看原文）")
     for i, (src, path) in enumerate(rows):
-        col_browse, col_open, col_locate = st.columns([0.34, 0.5, 0.16])
         loc = _location_label(src)
         label = f"📄 {src['name']}" + (f" · {loc}" if loc else "")
-        if col_browse.button(
-            "🌐 浏览器查看", key=f"{key_prefix}_view_{i}", help="在当前页面查看原文并定位到引用处"
-        ):
+        if st.button(label, key=f"{key_prefix}_view_{i}"):
             _show_preview(src["name"], src)
-        if col_open.button(label, key=f"{key_prefix}_open_{i}", help=str(path)):
-            _open_at_location(path, src)
-        if col_locate.button("📁 定位", key=f"{key_prefix}_loc_{i}", help="在资源管理器中选中该文件"):
-            subprocess.Popen(["explorer", "/select,", str(path)])
+
+        # 下方两个按钮是服务器本机操作，远程用户点了没反应，先屏蔽：
+        # if col_open.button(label, key=f"{key_prefix}_open_{i}", help=str(path)):
+        #     _open_at_location(path, src)
+        # if col_locate.button("📁 定位", key=f"{key_prefix}_loc_{i}", help="在资源管理器中选中该文件"):
+        #     subprocess.Popen(["explorer", "/select,", str(path)])
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +304,7 @@ with st.sidebar:
             "上传文档（可多选）",
             type=list(parsers.SUPPORTED_EXTENSIONS),
             accept_multiple_files=True,
-            help="支持 PDF / DOCX / DOC / TXT，不支持扫描件（无 OCR）。.doc 需本机装有 Word。",
+            help="支持 PDF / DOCX / DOC / TXT，不支持扫描件（无 OCR）。.doc 需服务端装有 Word。",
         )
 
         if uploaded_files:
@@ -491,13 +497,21 @@ if prompt:
                 # 不把技术细节写进对话历史，只给用户友好提示
                 answer = "抱歉，当前无法完成回答，请稍后重试。"
             hit_sources = get_last_sources()
+            # 后台预热：在 Streamlit 渲染回答的同时多线程读取源文件文本，
+            # 等用户真正点预览按钮时 read_text 已经命中缓存了。
+            warmup_sources([s.get("name", "") for s in hit_sources], cfg.docs_dir)
 
         st.markdown(answer)
-        _render_source_actions(hit_sources, "live")
 
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": hit_sources}
-    )
+        # 关键：用 append 后的位置作为 key，让下面先渲染的 live 按钮和
+        # 下次 rerun 时历史循环渲染的按钮用完全相同的 key。
+        # 否则 live_view_0 和 histN_view_0 key 不匹配，用户第一次点击时
+        # 按钮状态变成孤儿、被 Streamlit 忽略，表现为"点了没反应"。
+        msg_idx = len(st.session_state.messages)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer, "sources": hit_sources}
+        )
+        _render_source_actions(hit_sources, f"hist{msg_idx}")
 
 # 底部提示
 st.caption(

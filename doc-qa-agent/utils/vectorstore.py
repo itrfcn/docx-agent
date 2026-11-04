@@ -393,6 +393,43 @@ def _brute_force_search(query: str, k: int) -> list[tuple[Document, float]]:
     return scored[:k]
 
 
+def _keyword_overlap_ok(query: str, text: str, min_kw_len: int = 2) -> bool:
+    """
+    二次校验：向量分数可能被 LLM 扩写的噪声词拉高（比如把"年假"扩成"年假 年休假 工龄"，
+    结果和出差补贴/奖惩条例撞分）。这里用简单关键词重叠兜底——query 里连续 ≥min_kw_len
+    的中文字串拆成 2-gram 滑窗，只要有一个 gram 在 doc 里出现，就认为有实质关联。
+    英文单词 / 数字串按原串匹配。
+    """
+    if not query or not text:
+        return True
+
+    import re
+
+    # 切分 query 里的中文词串、英文单词、数字串
+    chunks = re.findall(r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+", query)
+    if not chunks:
+        return True
+
+    keywords: list[str] = []
+    for c in chunks:
+        if re.fullmatch(r"[\u4e00-\u9fff]+", c):
+            # 中文：长串拆成 2-gram 滑窗（"出差审批流程" → "出差""差审""审批""批流""流程"）
+            # 同时保留原串（短串就是完整关键词）
+            if len(c) >= min_kw_len:
+                keywords.append(c)
+            if len(c) > min_kw_len:
+                for i in range(len(c) - min_kw_len + 1):
+                    keywords.append(c[i:i + min_kw_len])
+        else:
+            keywords.append(c)
+
+    if not keywords:
+        return True
+
+    low = text.lower()
+    return any(kw.lower() in low for kw in keywords)
+
+
 def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     """
     根据 query 做相似度检索，返回 LangChain Document 列表。
@@ -401,6 +438,8 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     - 使用 similarity_search_with_relevance_scores 取带分数结果（要求 cosine 空间）
     - 低于 cfg.relevance_threshold 的片段直接丢弃；全部低于阈值时返回空列表，
       由调用方明确告知「未检索到相关片段」，避免硬凑无关内容
+    - 关键词重叠兜底：向量分过了阈值但内容和 query 完全无关键词关联的也丢掉
+      （防止 LLM 改写查询词跑偏导致"年假"匹配到"出差补贴"这类假阳性）
     - 同一来源最多保留 2 个片段：既保留同一文件的多个引用位置（供前端逐个定位），
       又避免单个文件占满 top_k 名额，保证结果覆盖更多文档
     """
@@ -431,6 +470,12 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
 
     # 相关性阈值过滤
     candidates = [doc for doc, score in scored if score is None or score >= threshold]
+
+    # 关键词重叠兜底：防止向量模型被 LLM 扩写的噪声词误导
+    candidates = [
+        doc for doc in candidates
+        if _keyword_overlap_ok(query, doc.page_content or "")
+    ]
 
     # 同一文件最多保留 2 片（保留多个引用位置），并按内容去重
     max_per_source = 2

@@ -66,10 +66,17 @@ def get_last_sources() -> list[dict]:
 def knowledge_search(query: str) -> str:
     """在企业内部文档知识库中检索与问题相关的文档片段。
     当用户询问企业管理制度、流程规范、产品与技术资料、FAQ、培训材料等业务问题时必须调用此工具。
-    输入：清晰、具体的检索关键词或问题。
+    输入：清晰、具体的检索关键词或问题（请直接使用用户的原始提问，不要自行添加、扩展或改写关键词）。
     输出：检索到的文档片段（含来源文件名），若无相关内容会明确说明。"""
+    # 忽略 LLM 可能自行扩写的 Action Input，强制使用用户原 query。
+    # 背景：LLM 常把短 query 扩成很长一串（如 "年假" → "员工手册 休假管理 带薪年休假 假期天数 累计工作年限"），
+    # 长 query 经 bge 嵌入后维度冗余，和完全不相关的 doc 也能撞出高分向量（维度诅咒），导致假阳性来源。
+    real_query = getattr(_source_ctx, "user_query", "") or (query or "").strip()
+    if not real_query:
+        return "知识库中未检索到相关片段（可能没有相关资料）。"
+
     try:
-        docs = vectorstore.similarity_search(query)
+        docs = vectorstore.similarity_search(real_query)
     except Exception as e:
         return f"[知识库检索异常] {e}"
 
@@ -323,6 +330,9 @@ def ask_agent(user_question: str, chat_history: list[tuple[str, str]] | None = N
     """
     executor = get_agent_executor()
     _source_ctx.items = []  # 重置本轮来源记录
+    # 存用户原 query：knowledge_search 会忽略 LLM 扩写的 Action Input，
+    # 强制用这份干净的原 query 做检索（防止 LLM 长扩写导致向量维度诅咒、假阳性飙升）
+    _source_ctx.user_query = (user_question or "").strip()
 
     # LangChain 的 chat_history 使用 BaseMessage 序列
     from langchain_core.messages import HumanMessage, AIMessage

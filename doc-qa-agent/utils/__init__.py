@@ -15,6 +15,7 @@ import os
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")  # 彻底跳过联网超时检查（省 ~5-8 秒）
 # 关闭 Chroma 匿名遥测：离线环境上报必然失败，只会刷无害报错日志
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 

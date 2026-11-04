@@ -23,6 +23,8 @@ from pathlib import Path
 
 # 国内网络可走 HuggingFace 镜像（已存在该环境变量时不覆盖）
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 PROJECT_ROOT = Path(__file__).resolve().parent

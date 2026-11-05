@@ -62,6 +62,12 @@ def get_last_sources() -> list[dict]:
     return list(getattr(_source_ctx, "items", []) or [])
 
 
+# 单轮问答内最多真正检索的次数。
+# 由于检索固定使用用户原问题（不接受 LLM 改写），重复调用必然返回完全相同的结果，
+# 多余调用只会白白增加 LLM 轮次、把检索原文反复堆进上下文，导致回答明显变慢。
+_MAX_SEARCH_CALLS = 2
+
+
 @tool
 def knowledge_search(query: str) -> str:
     """在企业内部文档知识库中检索与问题相关的文档片段。
@@ -75,6 +81,17 @@ def knowledge_search(query: str) -> str:
     if not real_query:
         return "知识库中未检索到相关片段（可能没有相关资料）。"
 
+    calls = int(getattr(_source_ctx, "search_calls", 0)) + 1
+    _source_ctx.search_calls = calls
+
+    # 已检索足够轮次仍想再查：说明模型在空转，直接要求它基于现有资料作答
+    if calls > _MAX_SEARCH_CALLS:
+        return (
+            "【检索结束】本轮检索次数已达上限，且检索始终基于用户原问题，"
+            "再次调用返回的内容与上轮完全相同。请立即根据上面已返回的资料输出 Final Answer；"
+            "若资料确实不足，请明确说明知识库暂无相关资料。"
+        )
+
     try:
         docs = vectorstore.similarity_search(real_query)
     except Exception as e:
@@ -82,6 +99,15 @@ def knowledge_search(query: str) -> str:
 
     if not docs:
         return "知识库中未检索到相关片段（可能没有相关资料）。"
+
+    # 结果与上一轮完全一致时明确告知模型，避免它误以为"换个说法能查到新内容"而无限重试
+    import hashlib
+
+    digest = hashlib.sha256(
+        "\n".join((d.page_content or "") for d in docs).encode("utf-8")
+    ).hexdigest()
+    repeated = digest == getattr(_source_ctx, "last_digest", "")
+    _source_ctx.last_digest = digest
 
     # 去重（按内容）并格式化，附带来源文件名
     seen: set[str] = set()
@@ -98,7 +124,15 @@ def knowledge_search(query: str) -> str:
     if not parts:
         return "知识库中未检索到相关片段（可能没有相关资料）。"
 
-    return "\n\n---\n\n".join(parts)
+    body = "\n\n---\n\n".join(parts)
+    if repeated:
+        return (
+            body
+            + "\n\n【提示】本次检索结果与上一轮完全相同（检索始终基于用户原问题，"
+            "改写关键词不会得到新内容）。请勿再次调用检索工具，"
+            "直接根据上述资料输出 Final Answer；资料不足则说明知识库暂无相关记录。"
+        )
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +364,8 @@ def ask_agent(user_question: str, chat_history: list[tuple[str, str]] | None = N
     """
     executor = get_agent_executor()
     _source_ctx.items = []  # 重置本轮来源记录
+    _source_ctx.search_calls = 0  # 重置检索计数（限制空转重试）
+    _source_ctx.last_digest = ""  # 重置上轮结果指纹（用于发现重复检索）
     # 存用户原 query：knowledge_search 会忽略 LLM 扩写的 Action Input，
     # 强制用这份干净的原 query 做检索（防止 LLM 长扩写导致向量维度诅咒、假阳性飙升）
     _source_ctx.user_query = (user_question or "").strip()

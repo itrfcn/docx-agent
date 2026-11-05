@@ -89,6 +89,9 @@ def _location_label(src: dict) -> str:
     """来源定位的简短说明。"""
     if src.get("page"):
         return f"第 {src['page']} 页"
+    if src.get("sheet"):
+        row = src.get("row")
+        return f"{src['sheet']} 第 {row} 行" if row else f"{src['sheet']} 表"
     if src.get("line"):
         return f"第 {src['line']} 行起"
     return ""
@@ -304,7 +307,7 @@ with st.sidebar:
             "上传文档（可多选）",
             type=list(parsers.SUPPORTED_EXTENSIONS),
             accept_multiple_files=True,
-            help="支持 PDF / DOCX / DOC / TXT，不支持扫描件（无 OCR）。.doc 需服务端装有 Word。",
+            help="支持 PDF / DOCX / DOC / TXT / XLSX / XLS，不支持扫描件（无 OCR）。.doc 需服务端装有 Word。",
         )
 
         if uploaded_files:
@@ -317,7 +320,18 @@ with st.sidebar:
                 for idx, uf in enumerate(uploaded_files):
                     try:
                         raw = uf.read()
-                        text = parsers.parse_file(raw, uf.name)
+                        # Excel 走独立的行级切片路径（一行一个切片，不做字符切分）
+                        ext = Path(uf.name).suffix.lower().lstrip(".")
+                        rows = (
+                            parsers.parse_excel_rows(raw, uf.name, cfg.chunk_size)
+                            if ext in parsers.EXCEL_EXTENSIONS
+                            else None
+                        )
+                        text = (
+                            parsers.rows_to_text(rows)
+                            if rows is not None
+                            else parsers.parse_file(raw, uf.name)
+                        )
                         # 原始文件落盘（解析成功后才保存，避免留下损坏文件）；
                         # 仅取文件名，忽略路径成分，防止路径穿越
                         safe_name = Path(uf.name).name
@@ -326,7 +340,7 @@ with st.sidebar:
                         # 同名覆盖：ingest_document 内部会先删除同名旧切片再写入，
                         # 此处仅用于区分提示文案（解析成功后才写库，失败不影响已有数据）
                         overwritten = uf.name in existing
-                        chunks = vectorstore.ingest_document(text, uf.name)
+                        chunks = vectorstore.ingest_document(text, uf.name, rows=rows)
                         success_count += 1
                         if overwritten:
                             st.success(f"🔁 {uf.name} — 已覆盖更新，{chunks} 个切片")

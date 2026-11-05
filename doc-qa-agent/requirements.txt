@@ -19,6 +19,9 @@ sentence-transformers>=2.2.0
 # ==================== 文档解析 ====================
 pdfplumber>=0.11.0
 python-docx>=1.1.0
+# Excel：.xlsx 用 openpyxl；.xls 用 xlrd 1.x（不经过 pandas，规避 pandas 3.x 与 xlrd<2.0 的冲突）
+openpyxl>=3.1.0
+xlrd>=1.2,<2.0
 # .doc（Word 97-2003）解析依赖本机 Word，通过 COM 调用
 pywin32>=306; sys_platform == "win32"
 

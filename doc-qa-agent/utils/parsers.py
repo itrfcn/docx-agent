@@ -1,15 +1,27 @@
 """
 文档解析模块
 ------------
-支持 PDF、DOCX、DOC、TXT 四种格式。
-对外暴露统一接口：parse_file(file_bytes: bytes, filename: str) -> str
+支持 PDF、DOCX、DOC、TXT、XLSX、XLS 六种格式。
+
+两类解析路径：
+1. 文本类（PDF / DOCX / DOC / TXT）：parse_file 返回整篇纯文本，交给通用字符切片器；
+2. 表格类（XLSX / XLS）：parse_excel_rows 返回「一行一个切片」的独立结构，
+   不走通用字符切片器，避免整行语义被字符窗口切断。
+
+对外接口：
+    parse_file(file_bytes, filename) -> str
+    parse_excel_rows(file_bytes, filename, max_chars=None) -> list[dict]
+    rows_to_text(rows) -> str
 失败时抛出 DocParseError，由调用方捕获并提示用户。
 """
 
 from __future__ import annotations
 
 import io
+import re
+from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 
 class DocParseError(Exception):
@@ -17,7 +29,13 @@ class DocParseError(Exception):
 
 
 # 支持的扩展名（小写，不含点）
-SUPPORTED_EXTENSIONS = {"pdf", "docx", "doc", "txt"}
+SUPPORTED_EXTENSIONS = {"pdf", "docx", "doc", "txt", "xlsx", "xls"}
+
+# 表格类格式：走「行级切片」独立路径
+EXCEL_EXTENSIONS = {"xlsx", "xls"}
+
+# 单行拼接后超过该长度时按列分组拆分（默认与 cfg.chunk_size 一致）
+_DEFAULT_ROW_MAX_CHARS = 400
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +156,345 @@ def _parse_txt(content: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Excel 解析（XLSX / XLS）—— 表格走独立的行级切片路径
+# ---------------------------------------------------------------------------
+_NUMERIC_RE = re.compile(r"^[¥￥$]?[+-]?\d[\d,]*(?:\.\d+)?[%％]?$")
+
+
+def _cell_text(value: Any) -> str:
+    """把单元格原始值转成适合入库的文本。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    # 数值：整数型的 float 去掉 .0，避免出现「800.0 元」这种噪声
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, datetime):
+        if value.hour or value.minute or value.second:
+            return value.strftime("%Y-%m-%d %H:%M")
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    # 单元格内换行/多空格压成单空格，避免破坏行级切片
+    return " ".join(str(value).split())
+
+
+def _looks_numeric(text: str) -> bool:
+    return bool(_NUMERIC_RE.match(text.strip()))
+
+
+def _is_blank_row(cells: list[str]) -> bool:
+    return not any(cells)
+
+
+def _nonempty_count(cells: list[str]) -> int:
+    return sum(1 for c in cells if c)
+
+
+def _is_numeric_row(cells: list[str]) -> bool:
+    """数值行判定：非空单元格中过半是纯数值（用于排除「纯数字标题行」）。"""
+    values = [c for c in cells if c]
+    if len(values) < 2:
+        return False
+    return sum(1 for c in values if _looks_numeric(c)) * 2 >= len(values)
+
+
+def _all_same(cells: list[str]) -> bool:
+    """整行非空单元格值完全相同 —— 横向合并单元格（标题行）被填充后的特征。"""
+    values = [c for c in cells if c]
+    return len(values) >= 2 and len(set(values)) == 1
+
+
+def _has_number_row(cells: list[str]) -> bool:
+    """
+    数据行判定：非空单元格中至少有一个纯数值。
+
+    不能要求「过半是数值」：很多标准表的列是「城市/职级/金额」，数值只占 1/4，
+    按过半判定会把数据行误并进表头，导致列名丢失。
+    """
+    values = [c for c in cells if c]
+    if len(values) < 2:
+        return False
+    return any(_looks_numeric(c) for c in values)
+
+
+def _read_xlsx(content: bytes) -> list[tuple[str, list[list[str]]]]:
+    """读取 xlsx，返回 [(工作表名, 二维单元格文本)]。"""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as e:
+        raise DocParseError("缺少依赖 openpyxl，请先执行 `pip install openpyxl`") from e
+
+    try:
+        book = load_workbook(io.BytesIO(content), data_only=True)
+    except Exception as e:
+        raise DocParseError(f"Excel（xlsx）解析失败（文件可能损坏或加密）：{e}") from e
+
+    try:
+        sheets: list[tuple[str, list[list[str]]]] = []
+        for ws in book.worksheets:
+            max_row = ws.max_row or 0
+            max_col = ws.max_column or 0
+            if max_row <= 0 or max_col <= 0:
+                continue
+
+            # 合并单元格：openpyxl 只在左上角保留值，必须把该值填充到整个区域，
+            # 否则合并区域其余行全为空，语义直接丢失。
+            merged: dict[tuple[int, int], str] = {}
+            for rng in ws.merged_cells.ranges:
+                value = _cell_text(ws.cell(rng.min_row, rng.min_col).value)
+                for r in range(rng.min_row, rng.max_row + 1):
+                    for c in range(rng.min_col, rng.max_col + 1):
+                        merged[(r, c)] = value
+
+            grid: list[list[str]] = []
+            for r_idx, row in enumerate(
+                ws.iter_rows(min_row=1, max_row=max_row, max_col=max_col, values_only=True),
+                start=1,
+            ):
+                grid.append([
+                    merged.get((r_idx, c_idx), _cell_text(value))
+                    for c_idx, value in enumerate(row, start=1)
+                ])
+            sheets.append((ws.title, grid))
+        return sheets
+    finally:
+        try:
+            book.close()
+        except Exception:
+            pass
+
+
+def _read_xls(content: bytes) -> list[tuple[str, list[list[str]]]]:
+    """读取 xls（Word 97-2003 时代的 Excel 格式），返回 [(工作表名, 二维单元格文本)]。"""
+    try:
+        import xlrd
+    except ImportError as e:
+        raise DocParseError('缺少依赖 xlrd，请先执行 `pip install "xlrd>=1.2,<2.0"`') from e
+
+    try:
+        # formatting_info=True 才会解析合并单元格记录（xlrd 2.x 不支持该参数，降级重试）
+        try:
+            book = xlrd.open_workbook(file_contents=content, formatting_info=True)
+        except TypeError:
+            book = xlrd.open_workbook(file_contents=content)
+    except Exception as e:
+        raise DocParseError(
+            f"Excel（xls）解析失败（文件可能损坏），建议用 Excel 另存为 .xlsx 后重新上传：{e}"
+        ) from e
+
+    sheets: list[tuple[str, list[list[str]]]] = []
+    for sheet in book.sheets():
+        grid: list[list[str]] = []
+        for r in range(sheet.nrows):
+            row: list[str] = []
+            for c in range(sheet.ncols):
+                cell = sheet.cell(r, c)
+                value: Any = cell.value
+                if cell.ctype == xlrd.XL_CELL_DATE:
+                    try:
+                        value = xlrd.xldate_as_datetime(cell.value, book.datemode)
+                    except Exception:
+                        value = cell.value
+                row.append(_cell_text(value))
+            grid.append(row)
+
+        # 合并单元格同样需要把左上角值填满整个区域
+        for rlo, rhi, clo, chi in getattr(sheet, "merged_cells", []):
+            top = grid[rlo][clo] if rlo < len(grid) and clo < len(grid[rlo]) else ""
+            for r in range(rlo, min(rhi, len(grid))):
+                for c in range(clo, min(chi, len(grid[r]))):
+                    grid[r][c] = top
+
+        sheets.append((sheet.name, grid))
+    return sheets
+
+
+def _build_headers(header_rows: list[list[str]], width: int) -> list[str]:
+    """把（可能多行的）表头合并成列名：空列名补「列N」，重名加序号。"""
+    names: list[str] = []
+    for c in range(width):
+        parts: list[str] = []
+        for row in header_rows:
+            value = row[c] if c < len(row) else ""
+            if value and (not parts or parts[-1] != value):
+                parts.append(value)
+        names.append("/".join(parts))
+
+    seen: dict[str, int] = {}
+    for i, name in enumerate(names):
+        base = name or f"列{i + 1}"
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        names[i] = base if count == 0 else f"{base}_{count + 1}"
+    return names
+
+
+def _detect_layout(grid: list[list[str]]) -> tuple[list[str], int, str]:
+    """
+    识别表格结构，返回 (列名列表, 数据起始行索引, 表格标题)。
+
+    规则：
+    - 表头之前的纯标题行（整行只有 1 个非空单元格）跳过，第一个标题作为表格名；
+    - 以「出现数值行」的位置判定数据区起始，其上方连续非空行作为表头（支持多级表头）；
+    - 找不到数值行（全文本表）时退化为「第一行非空行做表头」。
+    """
+    last = len(grid)
+    while last > 0 and _is_blank_row(grid[last - 1]):
+        last -= 1
+    if last == 0:
+        return [], 0, ""
+
+    width = max(len(row) for row in grid)
+    max_nonempty = max(_nonempty_count(row) for row in grid)
+
+    idx = 0
+    title = ""
+    # 单列表格没有「整行仅 1 个非空单元格」的区分意义，不做标题剔除
+    if max_nonempty >= 2:
+        while idx < last:
+            cells = grid[idx]
+            nonempty = _nonempty_count(cells)
+            if nonempty == 0:
+                idx += 1
+                continue
+            # 标题行两种形态：只有 1 个非空单元格，或横向合并后被填充成整行同值
+            if (nonempty == 1 or _all_same(cells)) and not _is_numeric_row(cells):
+                title = title or next(c for c in cells if c)
+                idx += 1
+                continue
+            break
+
+    header_start = idx
+    if header_start >= last:
+        return [], last, title
+
+    data_start: int | None = None
+    for j in range(header_start, last):
+        if _has_number_row(grid[j]):
+            data_start = j
+            break
+
+    if data_start is None:
+        # 全文本表：第一行当表头
+        return _build_headers(grid[header_start:header_start + 1], width), header_start + 1, title
+
+    if data_start == header_start:
+        first = grid[header_start][0] if grid[header_start] else ""
+        if first and not _looks_numeric(first):
+            # 首列是文本、其余列多为数值 → 该行本身就是（年份/数字型多级）表头
+            return _build_headers(grid[header_start:header_start + 1], width), data_start + 1, title
+        # 首行就是数据行，没有表头
+        return [f"列{i + 1}" for i in range(width)], data_start, title
+
+    return _build_headers(grid[header_start:data_start], width), data_start, title
+
+
+def _row_text(prefix: str, pairs: list[tuple[str, str]]) -> str:
+    return prefix + "；".join(f"{key}: {value}" for key, value in pairs)
+
+
+def _split_pairs(
+    prefix: str,
+    pairs: list[tuple[str, str]],
+    key_pairs: list[tuple[str, str]],
+    max_chars: int,
+) -> list[str]:
+    """单行超长时按列分组拆分；每块都带表格前缀与行主键，保证语义自洽。"""
+    full = _row_text(prefix, pairs)
+    if len(full) <= max_chars:
+        return [full]
+
+    head = _row_text(prefix, key_pairs) + ("；" if key_pairs else "")
+    # 行主键已经写进 head，后续分组只处理剩余列，避免同一列重复出现两次
+    rest = pairs[len(key_pairs):]
+    if not rest:
+        return [full]
+
+    pieces: list[str] = []
+    buffer: list[tuple[str, str]] = []
+    for pair in rest:
+        if buffer and len(_row_text(head, buffer + [pair])) > max_chars:
+            pieces.append(_row_text(head, buffer))
+            buffer = [pair]
+        else:
+            buffer.append(pair)
+    if buffer:
+        pieces.append(_row_text(head, buffer))
+    return pieces
+
+
+def _build_sheet_chunks(sheet_name: str, grid: list[list[str]], max_chars: int) -> list[dict]:
+    """把一个工作表转成行级切片列表。"""
+    headers, data_start, title = _detect_layout(grid)
+    if not headers or data_start >= len(grid):
+        return []
+
+    # 前缀带工作表名与表格标题，给每一行提供上下文（避免不同表同名列串味）
+    prefix = f"【{sheet_name}】"
+    if title:
+        prefix += f"{title}｜"
+
+    chunks: list[dict] = []
+    width = len(headers)
+    for r in range(data_start, len(grid)):
+        cells = grid[r]
+        if _is_blank_row(cells):
+            continue
+        pairs = [
+            (headers[c], cells[c])
+            for c in range(min(width, len(cells)))
+            if cells[c]
+        ]
+        if not pairs:
+            continue
+        for content in _split_pairs(prefix, pairs, pairs[:2], max_chars):
+            chunks.append({"content": content, "sheet": sheet_name, "row": r + 1})
+    return chunks
+
+
+_EXCEL_READERS = {"xlsx": _read_xlsx, "xls": _read_xls}
+
+
+def parse_excel_rows(
+    file_bytes: bytes, filename: str, max_chars: int | None = None
+) -> list[dict]:
+    """
+    解析 Excel，返回行级切片列表（每行即一个独立入库单元）。
+
+    每个元素：{"content": 行文本, "line": 扁平文本行号, "sheet": 工作表名, "row": 原始行号}
+    line 与 rows_to_text 生成的行号严格一致，供前端定位与高亮复用。
+    """
+    ext = Path(filename).suffix.lower().lstrip(".")
+    if ext not in EXCEL_EXTENSIONS:
+        raise DocParseError(f"{filename} 不是支持的 Excel 格式。")
+
+    sheets = _EXCEL_READERS[ext](file_bytes)
+    limit = max_chars if max_chars and max_chars > 0 else _DEFAULT_ROW_MAX_CHARS
+
+    chunks: list[dict] = []
+    for sheet_name, grid in sheets:
+        chunks.extend(_build_sheet_chunks(sheet_name, grid, limit))
+
+    if not chunks:
+        raise DocParseError("Excel 未提取到有效数据行（请确认表格中有内容，且不是纯图片工作表）。")
+
+    for i, item in enumerate(chunks, start=1):
+        item["line"] = i
+    return chunks
+
+
+def rows_to_text(rows: list[dict]) -> str:
+    """把行级切片拼回扁平文本（与 parse_file 返回值一致，供哈希 / 预览复用）。"""
+    return "\n".join(
+        str(row.get("content") or "").strip()
+        for row in rows
+        if str(row.get("content") or "").strip()
+    )
+
+
+# ---------------------------------------------------------------------------
 # 统一入口
 # ---------------------------------------------------------------------------
 _PARSERS = {
@@ -164,7 +521,13 @@ def parse_file(file_bytes: bytes, filename: str) -> str:
     """
     ext = Path(filename).suffix.lower().lstrip(".")
     if ext not in SUPPORTED_EXTENSIONS:
-        raise DocParseError(f"暂不支持 {ext.upper()} 格式，仅支持 PDF / DOCX / DOC / TXT。")
+        raise DocParseError(
+            f"暂不支持 {ext.upper()} 格式，仅支持 PDF / DOCX / DOC / TXT / XLSX / XLS。"
+        )
+
+    # 表格类：返回行级切片拼接的扁平文本（切片逻辑在 parse_excel_rows 里独立实现）
+    if ext in EXCEL_EXTENSIONS:
+        return rows_to_text(parse_excel_rows(file_bytes, filename))
 
     parser = _PARSERS[ext]
     return parser(file_bytes)

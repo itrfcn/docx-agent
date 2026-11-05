@@ -272,6 +272,11 @@ def _export_pdf(src: Path, out: Path, snippet: str) -> int | None:
 def pdf_preview_url(path: Path, entry: dict) -> str | None:
     """生成浏览器可直接打开的 PDF 预览地址（带页码锚点）。"""
     try:
+        # Excel 没有 Word/PDF 版式预览：直接返回 None 走网页全文预览。
+        # 必须在这里提前返回，否则 Word 导出失败会被误标成「企业加密」文件。
+        if path.suffix.lower() in {".xlsx", ".xls"}:
+            return None
+
         STATIC_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
         _cleanup_cache()
         key = _cache_key(path)
@@ -326,6 +331,11 @@ def read_text(path: Path) -> str:
     except Exception:
         pass
 
+    # Excel 无法用 Word 兜底读取，直接返回空（避免无意义的 Word COM 调用）
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        _VERSION_TEXT_CACHE[cache_key] = ""
+        return ""
+
     # 走 Word 常驻：Open → Content.Text → Close
     def _do_word(app):
         if app is None:
@@ -375,8 +385,18 @@ def html_preview_url(path: Path, entry: dict) -> str | None:
         if not out.exists():
             body = html.escape(text)
             snippet = html.escape(str(entry.get("snippet") or ""))
-            if snippet and snippet in body:
-                body = body.replace(snippet, f'<mark id="hit">{snippet}</mark>', 1)
+            if snippet:
+                # 优先高亮「行号对应的那一行」：Excel / 文本类切片的片段前缀往往重复，
+                # 直接替换第一次出现会永远定位到第 1 行
+                lines = body.split("\n")
+                target = int(line_no or 0) - 1
+                if 0 <= target < len(lines) and snippet in lines[target]:
+                    lines[target] = lines[target].replace(
+                        snippet, f'<mark id="hit">{snippet}</mark>', 1
+                    )
+                    body = "\n".join(lines)
+                elif snippet in body:
+                    body = body.replace(snippet, f'<mark id="hit">{snippet}</mark>', 1)
 
             if page_no:
                 loc_text = f"第 {int(page_no)} 页"
@@ -447,7 +467,7 @@ def warmup_sources(names: list[str], docs_dir: Path) -> None:
             pass
         # 顺带把 PDF 也导一遍（首次 SaveAs2 ~0.5s，之后完全命中缓存）
         try:
-            if p.suffix.lower() != ".pdf":
+            if p.suffix.lower() not in {".pdf", ".xlsx", ".xls"}:
                 key = _cache_key(p)
                 out = STATIC_PREVIEW_DIR / f"{key}.pdf"
                 if not out.exists() and not _VERSION_PDF_ENCRYPTED.get(key):

@@ -1,14 +1,15 @@
 """
 本地文件夹批量导入
 ------------------
-用途：企业环境无法使用网页上传时，把 PDF/DOCX/DOC/TXT 放进 data/docs 目录，
+用途：企业环境无法使用网页上传时，把 PDF/DOCX/DOC/TXT/XLSX/XLS 放进 data/docs 目录，
       执行本脚本即可批量入库（复用 解析 → 切片 → embedding → Chroma 写入 链路）。
 
 用法：
     python import_docs.py
 
 规则：
-    - 递归扫描 data/docs 下的 pdf / docx / doc / txt
+    - 递归扫描 data/docs 下的 pdf / docx / doc / txt / xlsx / xls
+    - Excel 走独立的行级切片路径（一行一个切片），其余走通用文本切片
     - 已入库且内容未变化的文件自动跳过（manifest 中的 content_hash 一致）
     - 内容变化的文件自动「先删旧数据再重建」，避免重复片段与旧内容残留
     - 单个文件失败不影响其余文件
@@ -32,6 +33,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils import parsers, vectorstore  # noqa: E402
+from utils.config import cfg  # noqa: E402
 
 # 待扫描目录（可通过环境变量 IMPORT_DOCS_DIR 覆盖）
 DOCS_DIR = Path(os.getenv("IMPORT_DOCS_DIR", PROJECT_ROOT / "data" / "docs")).resolve()
@@ -64,12 +66,12 @@ def main() -> int:
 
     if not DOCS_DIR.exists():
         print(f"⚠️  目录不存在：{DOCS_DIR}")
-        print("   请先创建该目录，并把 pdf / docx / txt 文件放进去。")
+        print("   请先创建该目录，并把 pdf / docx / txt / xlsx / xls 文件放进去。")
         return 1
 
     files = _iter_doc_files(DOCS_DIR)
     if not files:
-        print("⚠️  目录为空（未找到 pdf / docx / txt 文件）。")
+        print("⚠️  目录为空（未找到受支持的文档文件）。")
         print("   请把文档放入后重新执行：python import_docs.py")
         return 0
 
@@ -90,7 +92,18 @@ def main() -> int:
         name = _source_name(path)
         try:
             raw = path.read_bytes()
-            text = parsers.parse_file(raw, path.name)
+            # Excel 走独立的行级切片路径（一行一个切片，不做字符切分）
+            ext = path.suffix.lower().lstrip(".")
+            rows = (
+                parsers.parse_excel_rows(raw, path.name, cfg.chunk_size)
+                if ext in parsers.EXCEL_EXTENSIONS
+                else None
+            )
+            text = (
+                parsers.rows_to_text(rows)
+                if rows is not None
+                else parsers.parse_file(raw, path.name)
+            )
             digest = vectorstore.content_hash(text)
 
             # 已入库且内容未变化 → 跳过；内容变化（或缺少 manifest 记录）→ 重建
@@ -106,7 +119,7 @@ def main() -> int:
                 print(f"[跳过] {name} —— 内容未变化")
                 continue
 
-            chunks = vectorstore.ingest_document(text, name)
+            chunks = vectorstore.ingest_document(text, name, rows=rows)
             if chunks <= 0:
                 raise RuntimeError("解析后无有效文本切片")
 

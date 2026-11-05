@@ -37,6 +37,12 @@ MANIFEST_PATH = cfg.chroma_persist_dir.parent / "manifest.json"
 # bge 官方约定：查询向量需加检索指令前缀（文档侧不加），可提升召回率
 QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 
+# 同一来源最多保留的片段数：
+# - 普通文档：2 片（保留多个引用位置，又避免单文件占满 top_k）
+# - Excel：5 片（表格每行语义独立，标准类问题要命中多行才能答全）
+MAX_PER_SOURCE = 2
+EXCEL_MAX_PER_SOURCE = 5
+
 # 项目根目录（用于把文档路径转换成相对展示位置）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -138,13 +144,16 @@ def _make_snippet(content: str, size: int = 20) -> str:
     return content.strip()[:size]
 
 
-def ingest_document(text: str, filename: str) -> int:
+def ingest_document(text: str, filename: str, rows: list[dict] | None = None) -> int:
     """
-    将单个文档文本切片后入库。
+    将单个文档入库。
 
     Args:
-        text:     文档完整文本（PDF 以 \f 表示分页边界）
+        text:     文档完整文本（PDF 以 \f 表示分页边界；Excel 为行级切片拼接文本）
         filename: 文档原始文件名（存为 metadata，用于引用）
+        rows:     Excel 行级切片（parse_excel_rows 的返回值）。
+                  传入时跳过通用字符切片器，直接按「一行一个切片」入库；
+                  不传时走原有的 RecursiveCharacterTextSplitter 逻辑。
 
     Returns:
         成功入库的切片数量
@@ -152,35 +161,55 @@ def ingest_document(text: str, filename: str) -> int:
     每个切片除 source 外，还记录定位信息：
         - PDF：page（页码）
         - 其它：line（行号）+ snippet（用于在 Word 中定位的文本片段）
+        - Excel：额外的 sheet（工作表名）、row（原始行号）、doc_type="excel"
     """
-    splitter = _make_splitter()
-    chunk_texts = splitter.split_text(text)
-    is_pdf = "\f" in text
-
     docs: list[Document] = []
-    cursor = 0
-    for chunk in chunk_texts:
-        content = chunk.strip()
-        if not content:
-            continue
 
-        # 定位切片在原文中的起始偏移（切片是原文的连续片段，按顺序向后查找即可）
-        start = text.find(chunk, cursor)
-        if start < 0:
-            start = text.find(chunk)
-        if start < 0:
-            start = cursor
-        cursor = start + len(chunk)
+    if rows is not None:
+        # ---- 表格独立路径：不做字符级切分，保留行边界 ----
+        for i, row in enumerate(rows):
+            content = str(row.get("content") or "").strip()
+            if not content:
+                continue
+            meta: dict = {
+                "source": filename,
+                "line": int(row.get("line") or (i + 1)),
+                "snippet": _make_snippet(content),
+                "doc_type": "excel",
+            }
+            if row.get("sheet"):
+                meta["sheet"] = str(row["sheet"])
+            if row.get("row"):
+                meta["row"] = int(row["row"])
+            docs.append(Document(page_content=content, metadata=meta))
+    else:
+        splitter = _make_splitter()
+        chunk_texts = splitter.split_text(text)
+        is_pdf = "\f" in text
 
-        meta: dict = {"source": filename}
-        if is_pdf:
-            meta["page"] = text[:start].count("\f") + 1
-            content = content.replace("\f", "\n").strip()
-        else:
-            meta["line"] = text[:start].count("\n") + 1
-        meta["snippet"] = _make_snippet(content)
+        cursor = 0
+        for chunk in chunk_texts:
+            content = chunk.strip()
+            if not content:
+                continue
 
-        docs.append(Document(page_content=content, metadata=meta))
+            # 定位切片在原文中的起始偏移（切片是原文的连续片段，按顺序向后查找即可）
+            start = text.find(chunk, cursor)
+            if start < 0:
+                start = text.find(chunk)
+            if start < 0:
+                start = cursor
+            cursor = start + len(chunk)
+
+            meta = {"source": filename}
+            if is_pdf:
+                meta["page"] = text[:start].count("\f") + 1
+                content = content.replace("\f", "\n").strip()
+            else:
+                meta["line"] = text[:start].count("\n") + 1
+            meta["snippet"] = _make_snippet(content)
+
+            docs.append(Document(page_content=content, metadata=meta))
 
     if not docs:
         return 0
@@ -471,14 +500,21 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     # 相关性阈值过滤
     candidates = [doc for doc, score in scored if score is None or score >= threshold]
 
-    # 关键词重叠兜底：防止向量模型被 LLM 扩写的噪声词误导
+    # 关键词重叠兜底：防止向量模型被 LLM 扩写的噪声词误导。
+    # Excel 行级切片本身很短、语义精确，且阈值已过滤，跳过该过滤避免误杀正确行。
     candidates = [
         doc for doc in candidates
-        if _keyword_overlap_ok(query, doc.page_content or "")
+        if doc.metadata.get("doc_type") == "excel"
+        or _keyword_overlap_ok(query, doc.page_content or "")
     ]
 
-    # 同一文件最多保留 2 片（保留多个引用位置），并按内容去重
-    max_per_source = 2
+    # Excel 片段需要多条一起才能答全「各职级标准」这类问题：
+    # 命中表格时把最终条数上限抬到 EXCEL_MAX_PER_SOURCE（否则会被 top_k=4 压住）
+    target = max(k, EXCEL_MAX_PER_SOURCE) if any(
+        doc.metadata.get("doc_type") == "excel" for doc in candidates
+    ) else k
+
+    # 同一文件保留的片数上限：普通文档 2 片，Excel 5 片；并按内容去重
     per_source: dict[str, int] = {}
     seen_contents: set[str] = set()
     unique: list[Document] = []
@@ -487,11 +523,12 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
         if not content or content in seen_contents:
             continue
         source = doc.metadata.get("source", "")
-        if per_source.get(source, 0) >= max_per_source:
+        limit = EXCEL_MAX_PER_SOURCE if doc.metadata.get("doc_type") == "excel" else MAX_PER_SOURCE
+        if per_source.get(source, 0) >= limit:
             continue
         seen_contents.add(content)
         per_source[source] = per_source.get(source, 0) + 1
         unique.append(doc)
-        if len(unique) >= k:
+        if len(unique) >= target:
             break
     return unique

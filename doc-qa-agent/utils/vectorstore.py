@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,13 @@ QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 # - Excel：5 片（表格每行语义独立，标准类问题要命中多行才能答全）
 MAX_PER_SOURCE = 2
 EXCEL_MAX_PER_SOURCE = 5
+
+# Excel 词面补召回：扫描规模上限与最高加分（避免大表拖慢检索）
+EXCEL_LEXICAL_SCAN_LIMIT = 3000
+EXCEL_LEXICAL_BOOST = 0.25
+# 只让「稀有词」参与加权：命中片段占比超过该比例的泛词（如「安全」「住宿」）不加分，
+# 否则任何表格行只要带「(含安全)」列就会被抬进结果，产生假阳性
+EXCEL_LEXICAL_MAX_DF_RATIO = 0.15
 
 # 项目根目录（用于把文档路径转换成相对展示位置）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -422,6 +430,27 @@ def _brute_force_search(query: str, k: int) -> list[tuple[Document, float]]:
     return scored[:k]
 
 
+def _extract_keywords(query: str, min_kw_len: int = 2) -> list[str]:
+    """
+    从查询里抽取关键词：中文长串拆 2-gram 滑窗并保留原串，英文单词 / 数字串按原串。
+    """
+    import re
+
+    chunks = re.findall(r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+", query or "")
+    keywords: list[str] = []
+    for c in chunks:
+        if re.fullmatch(r"[\u4e00-\u9fff]+", c):
+            # 同时保留原串（短串就是完整关键词）
+            if len(c) >= min_kw_len:
+                keywords.append(c)
+            if len(c) > min_kw_len:
+                for i in range(len(c) - min_kw_len + 1):
+                    keywords.append(c[i:i + min_kw_len])
+        else:
+            keywords.append(c)
+    return keywords
+
+
 def _keyword_overlap_ok(query: str, text: str, min_kw_len: int = 2) -> bool:
     """
     二次校验：向量分数可能被 LLM 扩写的噪声词拉高（比如把"年假"扩成"年假 年休假 工龄"，
@@ -432,31 +461,62 @@ def _keyword_overlap_ok(query: str, text: str, min_kw_len: int = 2) -> bool:
     if not query or not text:
         return True
 
-    import re
-
-    # 切分 query 里的中文词串、英文单词、数字串
-    chunks = re.findall(r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+", query)
-    if not chunks:
-        return True
-
-    keywords: list[str] = []
-    for c in chunks:
-        if re.fullmatch(r"[\u4e00-\u9fff]+", c):
-            # 中文：长串拆成 2-gram 滑窗（"出差审批流程" → "出差""差审""审批""批流""流程"）
-            # 同时保留原串（短串就是完整关键词）
-            if len(c) >= min_kw_len:
-                keywords.append(c)
-            if len(c) > min_kw_len:
-                for i in range(len(c) - min_kw_len + 1):
-                    keywords.append(c[i:i + min_kw_len])
-        else:
-            keywords.append(c)
-
+    keywords = _extract_keywords(query, min_kw_len)
     if not keywords:
         return True
 
     low = text.lower()
     return any(kw.lower() in low for kw in keywords)
+
+
+def _excel_lexical_scored(query: str, threshold: float) -> list[tuple[Document, float]]:
+    """
+    Excel 行级切片的词面补召回（混合检索）。
+
+    bge-small-zh 对「印度」这类实体词区分度很低，表格行又缺少「报销标准」这类泛词，
+    实测印度行会掉到向量排名 100 名开外。这里按片段内的词频算 IDF：
+    越稀有的命中词权重越高（「印度」只命中 1 条 → 直接顶到最前），
+    具体分数抬到阈值之上，再与向量分统一排序。
+    """
+    keywords = _extract_keywords(query)
+    if not keywords:
+        return []
+
+    vs = get_vectorstore()
+    try:
+        data = vs.get(where={"doc_type": "excel"}, include=["documents", "metadatas"])
+    except Exception:
+        return []
+
+    documents = data.get("documents") or []
+    metadatas = data.get("metadatas") or []
+    if not documents or len(documents) > EXCEL_LEXICAL_SCAN_LIMIT:
+        return []
+
+    total = len(documents)
+    lows = [(doc or "").lower() for doc in documents]
+    df = {kw: sum(1 for low in lows if kw.lower() in low) for kw in keywords}
+    max_df = max(1, int(total * EXCEL_LEXICAL_MAX_DF_RATIO))
+    max_idf = math.log(total + 1)
+
+    scored: list[tuple[Document, float]] = []
+    for i, low in enumerate(lows):
+        if not low:
+            continue
+        best_idf = 0.0
+        for kw in keywords:
+            if df[kw] > max_df:  # 泛词不参与加权
+                continue
+            if kw.lower() in low:
+                best_idf = max(best_idf, math.log((total + 1) / (df[kw] + 1)))
+        if best_idf <= 0:
+            continue
+        score = threshold + EXCEL_LEXICAL_BOOST * min(1.0, best_idf / max_idf)
+        scored.append((
+            Document(page_content=documents[i] or "", metadata=dict(metadatas[i] or {})),
+            score,
+        ))
+    return scored
 
 
 def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
@@ -467,6 +527,7 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     - 使用 similarity_search_with_relevance_scores 取带分数结果（要求 cosine 空间）
     - 低于 cfg.relevance_threshold 的片段直接丢弃；全部低于阈值时返回空列表，
       由调用方明确告知「未检索到相关片段」，避免硬凑无关内容
+    - Excel 片段额外做一次 IDF 词面补召回，解决实体词（国家/城市/职级）向量分过低的问题
     - 关键词重叠兜底：向量分过了阈值但内容和 query 完全无关键词关联的也丢掉
       （防止 LLM 改写查询词跑偏导致"年假"匹配到"出差补贴"这类假阳性）
     - 同一来源最多保留 2 个片段：既保留同一文件的多个引用位置（供前端逐个定位），
@@ -478,7 +539,9 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
 
     # 候选数不能超过集合实际切片数，否则 hnswlib 会抛出
     # "Cannot return the results in a contigious 2D array. Probably ef or M is too small"
-    want = k * 2
+    # 候选池放大：多个文件命中时，top_k*2 的池子容易被单个大文件占满，
+    # 导致其他文件（如海外标准里的一行）根本进不了候选，这里按 top_k*4 取。
+    want = k * 4
     count = _collection_count(vs)
     if count <= 0:
         return []  # 空集合直接返回，避免 hnswlib 在空索引上崩溃
@@ -496,6 +559,11 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
         except Exception:
             # 兜底 2：绕过 HNSW 索引，直接全量算相似度
             scored = _brute_force_search(query, want)
+
+    # Excel 词面补召回（混合检索）：实体词在向量空间区分度低，靠 IDF 加权把
+    # 「印度」这类稀有命中顶到前面；与向量候选合并后统一按分数排序。
+    scored.extend(_excel_lexical_scored(query, threshold))
+    scored.sort(key=lambda pair: pair[1] if pair[1] is not None else 0.0, reverse=True)
 
     # 相关性阈值过滤
     candidates = [doc for doc, score in scored if score is None or score >= threshold]

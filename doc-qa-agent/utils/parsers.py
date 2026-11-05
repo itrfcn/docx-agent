@@ -219,6 +219,32 @@ def _has_number_row(cells: list[str]) -> bool:
     return any(_looks_numeric(c) for c in values)
 
 
+_YEAR_RE = re.compile(r"^(?:19|20)\d{2}(?:年|年度)?$")
+
+
+def _header_base(name: str) -> str:
+    """去掉重名去重时追加的 _2 / _3 后缀，还原原始列名。"""
+    return re.sub(r"_\d+$", "", name) if name else ""
+
+
+def _is_time_series_sheet(headers: list[str]) -> bool:
+    """
+    表头过半是年份/纯数字列 → 年度统计或计划表，不是制度/标准类表格，跳过入库。
+
+    例如残留模板表「国家 | 2008年 | 公司愿景 | 2008年」，入库后只会变成噪声。
+    自动补名的空列（列3、列4…）不参与占比计算，否则会把统计表的判据稀释掉。
+    """
+    names = [
+        _header_base(h)
+        for h in headers
+        if h and not re.fullmatch(r"列\d+", h)
+    ]
+    if len(names) < 2:
+        return False
+    yearish = sum(1 for h in names if _YEAR_RE.match(h) or _looks_numeric(h))
+    return yearish * 2 >= len(names)
+
+
 def _read_xlsx(content: bytes) -> list[tuple[str, list[list[str]]]]:
     """读取 xlsx，返回 [(工作表名, 二维单元格文本)]。"""
     try:
@@ -430,6 +456,9 @@ def _build_sheet_chunks(sheet_name: str, grid: list[list[str]], max_chars: int) 
     headers, data_start, title = _detect_layout(grid)
     if not headers or data_start >= len(grid):
         return []
+    # 年度统计表 / 计划表不是制度类内容，跳过避免污染知识库
+    if _is_time_series_sheet(headers):
+        return []
 
     # 前缀带工作表名与表格标题，给每一行提供上下文（避免不同表同名列串味）
     prefix = f"【{sheet_name}】"
@@ -442,11 +471,20 @@ def _build_sheet_chunks(sheet_name: str, grid: list[list[str]], max_chars: int) 
         cells = grid[r]
         if _is_blank_row(cells):
             continue
-        pairs = [
-            (headers[c], cells[c])
-            for c in range(min(width, len(cells)))
-            if cells[c]
-        ]
+        pairs: list[tuple[str, str]] = []
+        prev_base = ""
+        prev_value = ""
+        for c in range(min(width, len(cells))):
+            value = cells[c]
+            if not value:
+                continue
+            # 合并表头会把同一列拆成「交通工具 / 交通工具_2 / 交通工具_3」，
+            # 相邻且列名、列值都相同的列只保留一次，避免同一句话重复三遍。
+            base = _header_base(headers[c])
+            if base == prev_base and value == prev_value:
+                continue
+            pairs.append((headers[c], value))
+            prev_base, prev_value = base, value
         if not pairs:
             continue
         for content in _split_pairs(prefix, pairs, pairs[:2], max_chars):

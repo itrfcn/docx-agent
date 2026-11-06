@@ -64,6 +64,11 @@ EXCEL_LEXICAL_MAX_DF_RATIO = 0.15
 # 单字回退的稀有度更严：单字极易误中（如「理」出现在「交通费处理」），
 # 只有真正的专名（香港→「港」、宿迁→「宿」，整张表只出现 1~2 次）才允许加分
 EXCEL_LEXICAL_CHAR_MAX_DF = 3
+# 「稀有实体精确命中」判定：多字词（如「日本」「北京」）在整张表里只出现不超过这么多次时，
+# 视为强证据。表格行是「字段名: 值;」拼接的结构化文本，cross-encoder 对自然语言问法
+# 打分极低（实测「日本出差报销多少」→ 日本行 0.06），但实体词本身精确命中足够可靠，
+# 这类片段不应被重排阈值直接淘汰。
+EXCEL_LEXICAL_STRONG_DF = 3
 
 # 项目根目录（用于把文档路径转换成相对展示位置）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -490,6 +495,30 @@ def _keyword_overlap_ok(query: str, text: str, min_kw_len: int = 2) -> bool:
     return any(kw.lower() in low for kw in keywords)
 
 
+# 单字左右两侧的分隔符：只有作为独立字段值出现才算实体命中
+_CHAR_LEFT_SEP = ":：、；;，, \t"
+_CHAR_RIGHT_SEP = "、；;，,。. \t"
+
+
+def _is_standalone_char(ch: str, text: str) -> bool:
+    """
+    判断单字是否作为独立字段值出现，而不是混在普通词语里。
+
+    「国家: 港、澳、台」里的「港」左右都是分隔符 → 是实体简称；
+    「明细表」里的「单」左边是「菜」→ 不是实体，不能当强证据。
+    """
+    start = 0
+    while True:
+        i = text.find(ch, start)
+        if i < 0:
+            return False
+        left_ok = i == 0 or text[i - 1] in _CHAR_LEFT_SEP
+        right_ok = i == len(text) - 1 or text[i + 1] in _CHAR_RIGHT_SEP
+        if left_ok and right_ok:
+            return True
+        start = i + 1
+
+
 def _excel_lexical_scored(query: str, threshold: float) -> list[tuple[Document, float]]:
     """
     Excel 行级切片的词面补召回（混合检索）。
@@ -527,6 +556,7 @@ def _excel_lexical_scored(query: str, threshold: float) -> list[tuple[Document, 
     for ch in single_chars:
         if ch not in df:
             df[ch] = sum(1 for low in lows if ch in low)
+    single_char_set = set(single_chars)
     keywords = keywords + single_chars
 
     max_df = max(1, int(total * EXCEL_LEXICAL_MAX_DF_RATIO))
@@ -537,6 +567,7 @@ def _excel_lexical_scored(query: str, threshold: float) -> list[tuple[Document, 
         if not low:
             continue
         best_idf = 0.0
+        strong = False
         for kw in keywords:
             # 单字走更严的稀有度上限，多字词按比例上限
             kw_max_df = EXCEL_LEXICAL_CHAR_MAX_DF if len(kw) == 1 else max_df
@@ -544,13 +575,25 @@ def _excel_lexical_scored(query: str, threshold: float) -> list[tuple[Document, 
                 continue
             if kw.lower() in low:
                 best_idf = max(best_idf, math.log((total + 1) / (df[kw] + 1)))
+                # 稀有实体精确命中 → 强证据，后续重排阶段即使语义分很低也要保留。
+                # 多字词（「日本」「北京」）按 STRONG_DF 判定；
+                # 单字只允许「多字词整体没命中后退化出来的简称」（香港→「港」），
+                # 且 df≤2 才算专名，避免「理」「程」这类常用字误触发。
+                if len(kw) >= 2 and df[kw] <= EXCEL_LEXICAL_STRONG_DF:
+                    strong = True
+                elif (
+                    kw in single_char_set
+                    and df[kw] <= 2
+                    and _is_standalone_char(kw, low)
+                ):
+                    strong = True
         if best_idf <= 0:
             continue
         score = threshold + EXCEL_LEXICAL_BOOST * min(1.0, best_idf / max_idf)
-        scored.append((
-            Document(page_content=documents[i] or "", metadata=dict(metadatas[i] or {})),
-            score,
-        ))
+        meta = dict(metadatas[i] or {})
+        if strong:
+            meta["_lexical_strong"] = True
+        scored.append((Document(page_content=documents[i] or "", metadata=meta), score))
     return scored
 
 
@@ -690,14 +733,21 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     scored.extend(_excel_lexical_scored(query, threshold))  # Excel 补召回用原始 query，避免扩展词误伤
     scored.sort(key=lambda pair: pair[1] if pair[1] is not None else 0.0, reverse=True)
 
-    # 候选按内容去重，减少重排的重复计算（同一表格的相邻切片大量重叠）
+    # 候选按内容去重，减少重排的重复计算（同一表格的相邻切片大量重叠）。
+    # 同一内容可能同时来自向量召回和词面补召回，保留先出现（分更高）的那条，
+    # 但要把词面补召回标记合并过来，否则去重会丢掉「稀有实体精确命中」的信息。
     deduped: list[Document] = []
-    seen_candidates: set[str] = set()
+    seen_candidates: dict[str, Document] = {}
     for doc, _score in scored:
         content = doc.page_content or ""
-        if not content or content in seen_candidates:
+        if not content:
             continue
-        seen_candidates.add(content)
+        existed = seen_candidates.get(content)
+        if existed is not None:
+            if doc.metadata.get("_lexical_strong"):
+                existed.metadata["_lexical_strong"] = True
+            continue
+        seen_candidates[content] = doc
         deduped.append(doc)
 
     # 两阶段检索：重排器可用时由 cross-encoder 决定相关性；
@@ -707,7 +757,17 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
         # 降级时把候选池收回到与单阶段一致（k*4），避免宽召回的边缘噪声被阈值放进来
         candidates = _fallback_filter(scored[: k * 4], threshold, search_query)
     else:
-        candidates = reranked
+        # 稀有实体保底：表格行是「字段名: 值;」拼成的结构化文本，cross-encoder 对
+        # 自然语言问法打分极低（实测「日本出差报销多少」→ 日本行 0.06，直接低于阈值被丢）。
+        # 但「日本」这类在整张表只出现 1~3 次的实体词精确命中本身就是强证据，
+        # 这类片段追加在精排结果之后保留，避免整条正确数据检索不到。
+        kept = {id(doc) for doc in reranked}
+        strong_extra = [
+            doc
+            for doc in deduped
+            if id(doc) not in kept and doc.metadata.get("_lexical_strong")
+        ]
+        candidates = reranked + strong_extra[: max(1, k // 2)]
 
     # Excel 片段需要多条一起才能答全「各职级标准」这类问题：
     # 命中表格时把最终条数上限抬到 EXCEL_MAX_PER_SOURCE（否则会被 top_k=4 压住）
@@ -750,16 +810,34 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
         for src in sources_in_order:
             if len(unique) >= target:
                 break
+            picked: Document | None = None
+            # 优先该来源里「稀有实体精确命中」的片段：同一张境外表可能有「备注」这类
+            # 泛化行排在真正的「国家: 日本」行前面，按排序取第一条会保底保错。
             for doc in dedup:
                 if doc.metadata.get("source", "") != src:
+                    continue
+                if not doc.metadata.get("_lexical_strong"):
                     continue
                 content = doc.page_content or ""
                 if not content or content in seen_contents:
                     continue
-                seen_contents.add(content)
-                per_source[src] = 1
-                unique.append(doc)
+                picked = doc
                 break
+            # 该来源没有实体强命中时，退回排序第一条
+            if picked is None:
+                for doc in dedup:
+                    if doc.metadata.get("source", "") != src:
+                        continue
+                    content = doc.page_content or ""
+                    if not content or content in seen_contents:
+                        continue
+                    picked = doc
+                    break
+            if picked is None:
+                continue
+            seen_contents.add(picked.page_content or "")
+            per_source[src] = 1
+            unique.append(picked)
 
     # ---- 2) 剩余额度按重排分补齐 ----
     for doc in dedup:
@@ -779,5 +857,9 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
         seen_contents.add(content)
         per_source[src] = per_source.get(src, 0) + 1
         unique.append(doc)
+
+    # 清理内部检索标记，不泄漏给上层（引用展示 / Agent）
+    for doc in unique:
+        doc.metadata.pop("_lexical_strong", None)
 
     return unique

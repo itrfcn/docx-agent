@@ -39,9 +39,9 @@ MANIFEST_PATH = cfg.chroma_persist_dir.parent / "manifest.json"
 QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 
 # 同一来源最多保留的片段数：
-# - 普通文档：2 片（保留多个引用位置，又避免单文件占满 top_k）
+# - 普通文档：3 片（如「年假有几天」这类问题，答案集中在同一文件的相邻段落）
 # - Excel：5 片（表格每行语义独立，标准类问题要命中多行才能答全）
-MAX_PER_SOURCE = 2
+MAX_PER_SOURCE = 3
 EXCEL_MAX_PER_SOURCE = 5
 
 # Excel 词面补召回：扫描规模上限与最高加分（避免大表拖慢检索）
@@ -50,6 +50,9 @@ EXCEL_LEXICAL_BOOST = 0.25
 # 只让「稀有词」参与加权：命中片段占比超过该比例的泛词（如「安全」「住宿」）不加分，
 # 否则任何表格行只要带「(含安全)」列就会被抬进结果，产生假阳性
 EXCEL_LEXICAL_MAX_DF_RATIO = 0.15
+# 单字回退的稀有度更严：单字极易误中（如「理」出现在「交通费处理」），
+# 只有真正的专名（香港→「港」、宿迁→「宿」，整张表只出现 1~2 次）才允许加分
+EXCEL_LEXICAL_CHAR_MAX_DF = 3
 
 # 项目根目录（用于把文档路径转换成相对展示位置）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -457,8 +460,15 @@ def _keyword_overlap_ok(query: str, text: str, min_kw_len: int = 2) -> bool:
     结果和出差补贴/奖惩条例撞分）。这里用简单关键词重叠兜底——query 里连续 ≥min_kw_len
     的中文字串拆成 2-gram 滑窗，只要有一个 gram 在 doc 里出现，就认为有实质关联。
     英文单词 / 数字串按原串匹配。
+
+    注意：短查询（用户原始输入，如「年假有几天」）本身就是精确的，不做词面兜底，
+    否则「年假」vs「年休假」这类形态差异会把正确切片误杀。
     """
     if not query or not text:
+        return True
+
+    # 短查询跳过过滤：≤16 字的查询基本可以确认是用户原始输入，不含扩写噪声
+    if len(query.strip()) <= 16:
         return True
 
     keywords = _extract_keywords(query, min_kw_len)
@@ -496,6 +506,18 @@ def _excel_lexical_scored(query: str, threshold: float) -> list[tuple[Document, 
     total = len(documents)
     lows = [(doc or "").lower() for doc in documents]
     df = {kw: sum(1 for low in lows if kw.lower() in low) for kw in keywords}
+
+    # 单字回退：表格里常用简称（如香港→「港、澳、台」），多字关键词完全无命中时
+    # 降级为单字匹配。泛字仍会被下面的稀有度约束拦掉。
+    single_chars: list[str] = []
+    for kw in keywords:
+        if df.get(kw, 0) == 0 and len(kw) >= 2 and all("\u4e00" <= ch <= "\u9fff" for ch in kw):
+            single_chars.extend(kw)
+    for ch in single_chars:
+        if ch not in df:
+            df[ch] = sum(1 for low in lows if ch in low)
+    keywords = keywords + single_chars
+
     max_df = max(1, int(total * EXCEL_LEXICAL_MAX_DF_RATIO))
     max_idf = math.log(total + 1)
 
@@ -505,7 +527,9 @@ def _excel_lexical_scored(query: str, threshold: float) -> list[tuple[Document, 
             continue
         best_idf = 0.0
         for kw in keywords:
-            if df[kw] > max_df:  # 泛词不参与加权
+            # 单字走更严的稀有度上限，多字词按比例上限
+            kw_max_df = EXCEL_LEXICAL_CHAR_MAX_DF if len(kw) == 1 else max_df
+            if df[kw] > kw_max_df:  # 泛词不参与加权
                 continue
             if kw.lower() in low:
                 best_idf = max(best_idf, math.log((total + 1) / (df[kw] + 1)))
@@ -582,7 +606,7 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
         doc.metadata.get("doc_type") == "excel" for doc in candidates
     ) else k
 
-    # 同一文件保留的片数上限：普通文档 2 片，Excel 5 片；并按内容去重
+    # 同一文件保留的片数上限：普通文档 3 片，Excel 5 片；并按内容去重
     per_source: dict[str, int] = {}
     seen_contents: set[str] = set()
     unique: list[Document] = []

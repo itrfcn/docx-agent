@@ -63,6 +63,16 @@ class Config:
         default_factory=lambda: float(_env("RELEVANCE_THRESHOLD", default="0.45"))
     )
 
+    # ---- OCR（扫描件 PDF / 图片）----
+    # PDF 页面提取到的文本少于该字符数时视为扫描页，自动触发 OCR
+    ocr_min_text_chars: int = field(
+        default_factory=lambda: int(_env("OCR_MIN_TEXT_CHARS", default="20"))  # type: ignore[assignment]
+    )
+    # 扫描页渲染 DPI：200 在识别率与速度之间较均衡，过大明显变慢
+    ocr_dpi: int = field(
+        default_factory=lambda: int(_env("OCR_DPI", default="200"))  # type: ignore[assignment]
+    )
+
     # ---- 管理口令（上传/清空等管理功能需要；留空则锁定管理功能）----
     admin_password: str = field(default_factory=lambda: _env("ADMIN_PASSWORD", default="") or "")
 

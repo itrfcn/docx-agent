@@ -272,9 +272,12 @@ def _export_pdf(src: Path, out: Path, snippet: str) -> int | None:
 def pdf_preview_url(path: Path, entry: dict) -> str | None:
     """生成浏览器可直接打开的 PDF 预览地址（带页码锚点）。"""
     try:
-        # Excel 没有 Word/PDF 版式预览：直接返回 None 走网页全文预览。
+        from utils import parsers
+
+        # Excel / 图片没有 Word/PDF 版式预览：直接返回 None 走网页全文预览。
         # 必须在这里提前返回，否则 Word 导出失败会被误标成「企业加密」文件。
-        if path.suffix.lower() in {".xlsx", ".xls"}:
+        ext = path.suffix.lower().lstrip(".")
+        if ext in parsers.EXCEL_EXTENSIONS or ext in parsers.IMAGE_EXTENSIONS:
             return None
 
         STATIC_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
@@ -331,8 +334,9 @@ def read_text(path: Path) -> str:
     except Exception:
         pass
 
-    # Excel 无法用 Word 兜底读取，直接返回空（避免无意义的 Word COM 调用）
-    if path.suffix.lower() in {".xlsx", ".xls"}:
+    # Excel / 图片无法用 Word 兜底读取，直接返回空（避免无意义的 Word COM 调用）
+    ext = path.suffix.lower().lstrip(".")
+    if ext in parsers.EXCEL_EXTENSIONS or ext in parsers.IMAGE_EXTENSIONS:
         _VERSION_TEXT_CACHE[cache_key] = ""
         return ""
 
@@ -454,6 +458,8 @@ def warmup_sources(names: list[str], docs_dir: Path) -> None:
     - 每个文件一个 daemon 线程，不阻塞主线程、不阻塞进程退出
     - 线程内部吞掉异常，不影响主线程
     """
+    from utils import parsers
+
     unique_paths = [
         docs_dir.resolve() / n
         for n in {str(n).strip() for n in names if n}
@@ -467,7 +473,12 @@ def warmup_sources(names: list[str], docs_dir: Path) -> None:
             pass
         # 顺带把 PDF 也导一遍（首次 SaveAs2 ~0.5s，之后完全命中缓存）
         try:
-            if p.suffix.lower() not in {".pdf", ".xlsx", ".xls"}:
+            ext = p.suffix.lower().lstrip(".")
+            if (
+                ext != "pdf"
+                and ext not in parsers.EXCEL_EXTENSIONS
+                and ext not in parsers.IMAGE_EXTENSIONS
+            ):
                 key = _cache_key(p)
                 out = STATIC_PREVIEW_DIR / f"{key}.pdf"
                 if not out.exists() and not _VERSION_PDF_ENCRYPTED.get(key):

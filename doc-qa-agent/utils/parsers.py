@@ -1,12 +1,14 @@
 """
 文档解析模块
 ------------
-支持 PDF、DOCX、DOC、TXT、XLSX、XLS 六种格式。
+支持 PDF、DOCX、DOC、TXT、XLSX、XLS 六种文档格式，以及 JPG / PNG 等图片。
 
-两类解析路径：
+三条解析路径：
 1. 文本类（PDF / DOCX / DOC / TXT）：parse_file 返回整篇纯文本，交给通用字符切片器；
+   PDF 中无文本层的页（扫描件）会自动 OCR，普通电子版 PDF 不受影响；
 2. 表格类（XLSX / XLS）：parse_excel_rows 返回「一行一个切片」的独立结构，
-   不走通用字符切片器，避免整行语义被字符窗口切断。
+   不走通用字符切片器，避免整行语义被字符窗口切断；
+3. 图片类（JPG / PNG / BMP / TIFF / WEBP）：整张图片 OCR 后返回纯文本。
 
 对外接口：
     parse_file(file_bytes, filename) -> str
@@ -19,9 +21,12 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from utils.config import cfg
 
 
 class DocParseError(Exception):
@@ -29,10 +34,16 @@ class DocParseError(Exception):
 
 
 # 支持的扩展名（小写，不含点）
-SUPPORTED_EXTENSIONS = {"pdf", "docx", "doc", "txt", "xlsx", "xls"}
+SUPPORTED_EXTENSIONS = {"pdf", "docx", "doc", "txt", "xlsx", "xls", "jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"}
 
 # 表格类格式：走「行级切片」独立路径
 EXCEL_EXTENSIONS = {"xlsx", "xls"}
+
+# 图片格式：整张图 OCR 后入库
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"}
+
+# 解析进度回调：(已处理页数, 总页数)
+ProgressCallback = Callable[[int, int], None]
 
 # 单行拼接后超过该长度时按列分组拆分（默认与 cfg.chunk_size 一致）
 _DEFAULT_ROW_MAX_CHARS = 400
@@ -41,7 +52,7 @@ _DEFAULT_ROW_MAX_CHARS = 400
 # ---------------------------------------------------------------------------
 # PDF 解析
 # ---------------------------------------------------------------------------
-def _parse_pdf(content: bytes) -> str:
+def _parse_pdf(content: bytes, progress: ProgressCallback | None = None) -> str:
     try:
         import pdfplumber
     except ImportError as e:
@@ -50,16 +61,32 @@ def _parse_pdf(content: bytes) -> str:
     text_parts: list[str] = []
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for page in pdf.pages:
+            total = len(pdf.pages)
+            for index, page in enumerate(pdf.pages, start=1):
                 page_text = page.extract_text() or ""
+
+                # 文本层过少视为扫描页：渲染成图片后 OCR，电子版页面完全不受影响
+                if len(page_text.strip()) < cfg.ocr_min_text_chars:
+                    ocr_text = _ocr_pdf_page(page, index)
+                    if ocr_text.strip():
+                        page_text = ocr_text
+
                 if page_text.strip():
                     # 用分页符 \f 保留页码边界，供入库时计算切片所在页码
                     text_parts.append(page_text.replace("\f", " ").strip() + "\f")
+
+                if progress is not None:
+                    progress(index, total)
+    except DocParseError:
+        raise
     except Exception as e:
         raise DocParseError(f"PDF 解析失败（文件可能损坏或加密）：{e}") from e
 
     if not text_parts:
-        raise DocParseError("PDF 未提取到任何文本内容（可能是纯扫描件，本工具不支持 OCR）。")
+        raise DocParseError(
+            "PDF 未提取到任何文本内容（扫描件 OCR 也未识别到文字，"
+            "或文件是纯图片且文字不清晰）。"
+        )
 
     return "\n".join(text_parts).rstrip("\f")
 
@@ -153,6 +180,99 @@ def _parse_txt(content: bytes) -> str:
         except UnicodeDecodeError:
             continue
     raise DocParseError("TXT 文件编码无法识别（已尝试 UTF-8 和 GBK）。")
+
+
+# ---------------------------------------------------------------------------
+# OCR 解析（扫描件 PDF / 图片）—— 使用本地 RapidOCR，全程离线
+# ---------------------------------------------------------------------------
+_ocr_engine = None
+_ocr_lock = threading.Lock()
+
+
+def _get_ocr_engine():
+    """懒加载 RapidOCR 单例（首次调用约需 1~2 秒加载模型）。"""
+    global _ocr_engine
+    if _ocr_engine is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError as e:
+            raise DocParseError(
+                "缺少 OCR 依赖，请先执行 `pip install rapidocr-onnxruntime`"
+            ) from e
+        try:
+            _ocr_engine = RapidOCR()
+        except Exception as e:
+            raise DocParseError(f"OCR 模型加载失败：{e}") from e
+    return _ocr_engine
+
+
+def _ocr_image(image) -> str:
+    """对 PIL 图片做 OCR，按识别顺序返回逐行文本。"""
+    import numpy as np
+
+    # RapidOCR 使用 OpenCV 约定，需要 BGR；转成连续内存避免部分版本报错
+    rgb = np.asarray(image.convert("RGB"))
+    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+
+    try:
+        with _ocr_lock:  # 引擎内部状态非线程安全
+            result, _ = _get_ocr_engine()(bgr)
+    except DocParseError:
+        raise
+    except Exception as e:
+        raise DocParseError(f"OCR 识别失败：{e}") from e
+
+    if not result:
+        return ""
+
+    lines: list[str] = []
+    for item in result:
+        if len(item) < 2:
+            continue
+        text = str(item[1]).strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def _ocr_pdf_page(page, page_no: int) -> str:
+    """把 PDF 页渲染为图片后 OCR；渲染失败时给出可读的提示。"""
+    try:
+        import pypdfium2  # noqa: F401  # pdfplumber 渲染依赖，缺失时提前报错
+        image = page.to_image(resolution=cfg.ocr_dpi).original
+    except ImportError as e:
+        raise DocParseError(
+            "缺少 PDF 渲染依赖 pypdfium2，请先执行 `pip install pypdfium2`"
+        ) from e
+    except Exception as e:
+        raise DocParseError(f"第 {page_no} 页扫描图渲染失败：{e}") from e
+    return _ocr_image(image)
+
+
+def _parse_image(content: bytes, progress: ProgressCallback | None = None) -> str:
+    """图片文件：整张图 OCR 后返回文本。"""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as e:
+        raise DocParseError("缺少依赖 Pillow，请先执行 `pip install Pillow`") from e
+
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            # 手机拍摄的照片常带方向信息，先摆正再识别
+            image = ImageOps.exif_transpose(image)
+            image.load()
+            text = _ocr_image(image)
+    except DocParseError:
+        raise
+    except Exception as e:
+        raise DocParseError(f"图片读取失败（文件可能损坏）：{e}") from e
+
+    if progress is not None:
+        progress(1, 1)
+
+    if not text.strip():
+        raise DocParseError("图片未识别到任何文字（请确认图片清晰、非纯图形）。")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -543,13 +663,18 @@ _PARSERS = {
 }
 
 
-def parse_file(file_bytes: bytes, filename: str) -> str:
+def parse_file(
+    file_bytes: bytes,
+    filename: str,
+    progress: ProgressCallback | None = None,
+) -> str:
     """
     解析单个文件，返回纯文本。
 
     Args:
         file_bytes: 文件原始字节
         filename:   原始文件名（用于判断扩展名）
+        progress:   解析进度回调（目前已处理页数, 总页数），用于扫描件 OCR 的进度展示
 
     Returns:
         解析后的纯文本字符串
@@ -560,12 +685,20 @@ def parse_file(file_bytes: bytes, filename: str) -> str:
     ext = Path(filename).suffix.lower().lstrip(".")
     if ext not in SUPPORTED_EXTENSIONS:
         raise DocParseError(
-            f"暂不支持 {ext.upper()} 格式，仅支持 PDF / DOCX / DOC / TXT / XLSX / XLS。"
+            f"暂不支持 {ext.upper()} 格式，仅支持 PDF / DOCX / DOC / TXT / XLSX / XLS "
+            "及 JPG / PNG / BMP / TIFF / WEBP 图片。"
         )
 
     # 表格类：返回行级切片拼接的扁平文本（切片逻辑在 parse_excel_rows 里独立实现）
     if ext in EXCEL_EXTENSIONS:
         return rows_to_text(parse_excel_rows(file_bytes, filename))
 
-    parser = _PARSERS[ext]
-    return parser(file_bytes)
+    # 图片类：整张图 OCR
+    if ext in IMAGE_EXTENSIONS:
+        return _parse_image(file_bytes, progress)
+
+    # PDF 需要透传进度回调（扫描页 OCR 可能较慢）
+    if ext == "pdf":
+        return _parse_pdf(file_bytes, progress)
+
+    return _PARSERS[ext](file_bytes)

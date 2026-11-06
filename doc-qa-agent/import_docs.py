@@ -1,14 +1,15 @@
 """
 本地文件夹批量导入
 ------------------
-用途：企业环境无法使用网页上传时，把 PDF/DOCX/DOC/TXT/XLSX/XLS 放进 data/docs 目录，
+用途：企业环境无法使用网页上传时，把 PDF/DOCX/DOC/TXT/XLSX/XLS/图片 放进 data/docs 目录，
       执行本脚本即可批量入库（复用 解析 → 切片 → embedding → Chroma 写入 链路）。
+      扫描件 PDF 与图片会自动 OCR（较慢，脚本会打印分页进度）。
 
 用法：
     python import_docs.py
 
 规则：
-    - 递归扫描 data/docs 下的 pdf / docx / doc / txt / xlsx / xls
+    - 递归扫描 data/docs 下的 pdf / docx / doc / txt / xlsx / xls 及 jpg / png 等图片
     - Excel 走独立的行级切片路径（一行一个切片），其余走通用文本切片
     - 已入库且内容未变化的文件自动跳过（manifest 中的 content_hash 一致）
     - 内容变化的文件自动「先删旧数据再重建」，避免重复片段与旧内容残留
@@ -58,6 +59,12 @@ def _iter_doc_files(root: Path) -> list[Path]:
     return files
 
 
+def _report_progress(done: int, pages: int) -> None:
+    """OCR / 逐页解析进度：每 10 页或结束时打印一次，避免刷屏。"""
+    if done == pages or done % 10 == 0:
+        print(f"       解析进度 {done}/{pages} 页")
+
+
 def main() -> int:
     print("=" * 64)
     print("本地文档批量导入")
@@ -102,7 +109,7 @@ def main() -> int:
             text = (
                 parsers.rows_to_text(rows)
                 if rows is not None
-                else parsers.parse_file(raw, path.name)
+                else parsers.parse_file(raw, path.name, progress=_report_progress)
             )
             digest = vectorstore.content_hash(text)
 

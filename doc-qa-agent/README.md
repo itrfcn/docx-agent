@@ -30,7 +30,8 @@
 
 | 特性         | 说明                                                |
 | ---------- | ------------------------------------------------- |
-| 文档入库       | 支持 PDF / DOCX / DOC / TXT / XLSX / XLS，可一次多选上传    |
+| 文档入库       | 支持 PDF / DOCX / DOC / TXT / XLSX / XLS 及 JPG / PNG 等图片，可一次多选上传 |
+| 扫描件 OCR    | 扫描版 PDF 无文本层的页自动 OCR；图片直接 OCR，全程本地离线运行          |
 | 本地向量化      | 使用 `BAAI/bge-small-zh-v1.5` 本地 Embedding，文档内容不出内网 |
 | 持久化知识库     | Chroma 本地持久化，重启程序数据不丢失                            |
 | Agent 自主检索 | LangChain 原生 ReAct Agent，自主判断是否需要检索，只注册 1 个检索工具   |
@@ -57,15 +58,16 @@
 | 向量库       | Chroma（本地持久化）                                             | cosine 距离空间             |
 | Embedding | sentence-transformers `BAAI/bge-small-zh-v1.5`            | 本地 CPU 运行，约 90 MB       |
 | 文档解析      | pdfplumber / python-docx / pywin32(COM) / openpyxl / xlrd | 见[支持的文档格式](#支持的文档格式)    |
+| OCR       | RapidOCR（onnxruntime）                                     | 本地离线运行，模型随包内置，无需联网            |
 | 配置        | python-dotenv                                             | 读取项目根目录 `.env`          |
 | LLM       | 通义千问（OpenAI 兼容接口）                                         | 默认 `qwen-plus`，可换任意兼容模型 |
 
-> 依赖版本在 `requirements.txt` 中锁定：LangChain 固定 `0.3.x`（`1.x` 已移除 ReAct 相关接口）；`.xls` 需要 `xlrd>=1.2,<2.0`。
+> 依赖版本在 `requirements.txt` 中锁定：LangChain 固定 `0.3.x`（`1.x` 已移除 ReAct 相关接口）；`.xls` 需要 `xlrd>=1.2,<2.0`；OCR 依赖 `rapidocr-onnxruntime`（会带入 onnxruntime 与 opencv），整体安装包会比无 OCR 版本大 100 MB 左右。
 
 ## 工作原理
 
 ```
-上传文件 → 解析文本 → 切片 → bge-small-zh 向量化 → Chroma 持久化
+上传文件 → 解析文本（扫描页 / 图片自动 OCR）→ 切片 → bge-small-zh 向量化 → Chroma 持久化
                                                         │
 用户提问 → ReAct Agent（Thought/Action） → knowledge_search ─┘
                     │
@@ -90,7 +92,7 @@ doc-qa-agent/
 ├── utils/
 │   ├── __init__.py             # HF 离线/镜像等环境变量（须先于其它库导入）
 │   ├── config.py               # .env 配置加载、密钥脱敏、写回 .env
-│   ├── parsers.py              # PDF / DOCX / DOC / TXT / XLSX / XLS 解析与行级切片
+│   ├── parsers.py              # 各格式解析、扫描件/图片 OCR 与行级切片
 │   ├── vectorstore.py          # Chroma 入库 / 检索 / 删除 / 清空 / manifest
 │   ├── agent.py                # ReAct Agent + 唯一工具 knowledge_search + 降级策略
 │   └── preview.py              # PDF / HTML 原文预览生成与缓存
@@ -192,6 +194,8 @@ streamlit run app.py
 | `CHUNK_OVERLAP`       | 否  | `64`                     | 切片重叠长度                                                              |
 | `RETRIEVER_TOP_K`     | 否  | `4`                      | 每次检索返回的片段数上限                                                        |
 | `RELEVANCE_THRESHOLD` | 否  | `0.45`                   | 相关性阈值（0\~1），低于该分数的片段不返回                                             |
+| `OCR_MIN_TEXT_CHARS`  | 否  | `20`                     | PDF 页面文本少于该字符数时视为扫描页并 OCR；设为 `0` 可关闭自动 OCR                          |
+| `OCR_DPI`             | 否  | `200`                    | 扫描页渲染 DPI；调高更清晰但明显更慢                                                |
 | `ADMIN_PASSWORD`      | 否  | 空                        | 管理口令；留空则锁定上传/删除/清空功能                                                |
 | `IMPORT_DOCS_DIR`     | 否  | `./data/docs`            | **仅批量导入脚本使用**，扫描目录                                                  |
 
@@ -211,6 +215,7 @@ streamlit run app.py
 2. 点击「✅ 入库所选文件」，界面会显示每个文件的入库结果与切片数。
 3. 同名文件再次上传会**覆盖更新**：先删除旧切片再写入新切片，不会产生重复内容。
 4. 原始文件会复制到 `data/docs/`，用于后续预览和下载。
+5. 扫描版 PDF 和图片会自动 OCR，界面按页显示解析进度；页数多时请耐心等待，期间不要重复点击。若确认不需要扫描件识别，可在 `.env` 中设置 `OCR_MIN_TEXT_CHARS=0`。
 
 ### 问答与引用
 
@@ -244,7 +249,8 @@ streamlit run app.py
 ### 入库与切片
 
 - **文本类文档**（PDF / DOCX / DOC / TXT）：按 `CHUNK_SIZE=400`、`CHUNK_OVERLAP=64` 递归切分，分隔符优先段落、换行、中文句号/问号/分号等。
-- **PDF**：使用分页符保留页码边界，切片 metadata 记录 `page`。
+- **PDF**：使用分页符保留页码边界，切片 metadata 记录 `page`。页面文本少于 `OCR_MIN_TEXT_CHARS` 时，自动把该页渲染成图片交给 RapidOCR 识别；有文本层的页面直接提取，不触发 OCR。
+- **图片**（JPG / PNG / BMP / TIFF / WEBP）：整张图 OCR 后按普通文本切片，图片按 `line` 定位。
 - **其它文本**：记录 `line`（起始行号）与 `snippet`（用于 Word 定位的原文片段）。
 - **Excel**：
   - 一行一个切片，不做字符级切分，避免整行语义被切断；
@@ -286,12 +292,13 @@ streamlit run app.py
 
 | 格式      | 解析方式              | 说明                                              |
 | ------- | ----------------- | ----------------------------------------------- |
-| `.pdf`  | pdfplumber        | 不支持扫描件（无 OCR）；加密/损坏会给出友好提示                      |
+| `.pdf`  | pdfplumber + RapidOCR | 有文本层直接提取；无文本层的扫描页自动 OCR；加密/损坏会给出友好提示            |
 | `.docx` | python-docx       | 同时提取正文段落与表格文本                                   |
 | `.doc`  | Word COM（pywin32） | 需要 Windows + 本机安装 Microsoft Word；否则请另存为 `.docx` |
 | `.txt`  | 内置                | 自动尝试 UTF-8，失败回退 GBK                             |
 | `.xlsx` | openpyxl          | 行级切片，支持合并单元格                                    |
 | `.xls`  | xlrd 1.x          | 行级切片；解析失败建议另存为 `.xlsx`                          |
+| `.jpg` / `.jpeg` / `.png` / `.bmp` / `.tif` / `.tiff` / `.webp` | RapidOCR | 整张图 OCR；无 PDF 版式预览，引用时展示识别文本     |
 
 单文件解析失败不会影响其它文件，界面会显示具体失败原因。
 
@@ -316,7 +323,8 @@ python import_docs.py
 
 行为说明：
 
-- 递归扫描 `data/docs` 下所有受支持格式，跳过 Word 临时文件 `~$xxx`；
+- 递归扫描 `data/docs` 下所有受支持格式（含图片），跳过 Word 临时文件 `~$xxx`；
+- 扫描件与图片自动 OCR，每 10 页打印一次解析进度；
 - 已入库且内容哈希未变化的文件自动跳过；
 - 内容变化的文件先删旧切片再重建；
 - 单个文件失败不影响其余文件，结束时输出汇总与失败明细；
@@ -342,8 +350,14 @@ A：首次需要加载 Embedding 模型和构建 LLM 客户端，通常需要数
 **Q：`.doc`** **文件解析失败？**
 A：`.doc` 通过本机 Word COM 解析。请确认 Windows 已安装 Microsoft Word；否则用 Word 另存为 `.docx` 后重新上传。
 
+**Q：扫描件 OCR 很慢 / 识别不准？**
+A：OCR 在本地 CPU 运行，约 1\~3 秒/页，页数多时请耐心等待。可调低 `OCR_DPI` 提速，或调大 `OCR_MIN_TEXT_CHARS` 减少触发；手写体、模糊拍照和复杂表格的识别效果有限，必要时先转成清晰 PDF。若完全不需要扫描件识别，设置 `OCR_MIN_TEXT_CHARS=0`。
+
+**Q：图片能像 PDF 一样预览版式吗？**
+A：图片没有 PDF 版式预览，引用时展示 OCR 文本并支持下载原文件。
+
 **Q：PDF 预览打不开 / 提示企业加密？**
-A：扫描件、DLP 加密文件或无法导出的文档会退回"网页版全文预览"；若仍无法生成，请使用"下载原文件"。
+A：图片没有 PDF 版式预览；DLP 加密文件或无法导出的文档会退回"网页版全文预览"；若仍无法生成，请使用"下载原文件"。
 
 **Q：清空知识库时提示失败？**
 A：通常是向量库目录被其它进程占用。关闭其它正在运行的实例后重试；数据清空逻辑已优先在 collection 层执行，一般无需手动删文件。
@@ -361,7 +375,8 @@ A：可以。只要提供 OpenAI 兼容接口，修改 `OPENAI_BASE_URL` 与 `MO
 
 - 仅注册 1 个工具（知识库检索），无联网、无代码执行、无外部 API 调用（LLM 除外）。
 - 不做权限体系、用户体系、审计日志；仅通过单一管理口令区分管理/普通用户。
-- 不支持 OCR、图片识别、扫描件 PDF。
+- OCR 面向印刷体与清晰截图：手写体、低分辨率扫描、复杂多栏/表格版式的识别效果有限，表格会退化为文本行。
+- 扫描件 OCR 为 CPU 计算，速度约 1\~3 秒/页，大文件入库会明显变慢。
 - Excel 只做文本行级入库，不保留公式计算结果以外的结构信息。
 - 不接 MES / OA / 工单等业务系统。
 - 回答仅作辅助参考，最终以正式文件与责任人判断为准。

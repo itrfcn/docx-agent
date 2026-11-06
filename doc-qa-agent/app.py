@@ -158,7 +158,10 @@ def _show_preview(name: str, entry: dict) -> None:
             type="secondary" if url else "primary",
         )
     if not url and html_url:
-        st.caption("该文件受企业加密保护，无法生成 PDF，已提供网页全文预览。")
+        if path.suffix.lower().lstrip(".") in parsers.IMAGE_EXTENSIONS:
+            st.caption("图片文件没有 PDF 版式预览，已提供 OCR 文本预览。")
+        else:
+            st.caption("该文件受企业加密保护，无法生成 PDF，已提供网页全文预览。")
     elif not url and not html_url:
         st.info("无法生成浏览器预览，请使用下方文本预览或下载原文件。")
 
@@ -362,7 +365,8 @@ with st.sidebar:
                 "上传文档（可多选）",
                 type=list(parsers.SUPPORTED_EXTENSIONS),
                 accept_multiple_files=True,
-                help="支持 PDF / DOCX / DOC / TXT / XLSX / XLS，不支持扫描件（无 OCR）。.doc 需服务端装有 Word。",
+                help="支持 PDF / DOCX / DOC / TXT / XLSX / XLS 及 JPG / PNG 等图片；"
+                "扫描件与图片会自动 OCR（较慢，请耐心等待）。.doc 需服务端装有 Word。",
                 label_visibility="collapsed",
             )
 
@@ -378,6 +382,15 @@ with st.sidebar:
                             raw = uf.read()
                             # Excel 走独立的行级切片路径（一行一个切片，不做字符切分）
                             ext = Path(uf.name).suffix.lower().lstrip(".")
+
+                            def _on_progress(done: int, pages: int) -> None:
+                                """扫描件 / 图片 OCR 较慢，按页反馈进度。"""
+                                fraction = (idx + (done / pages if pages else 0)) / total
+                                progress_bar.progress(
+                                    min(fraction, 1.0),
+                                    text=f"解析中：{uf.name}（{done}/{pages} 页）",
+                                )
+
                             rows = (
                                 parsers.parse_excel_rows(raw, uf.name, cfg.chunk_size)
                                 if ext in parsers.EXCEL_EXTENSIONS
@@ -386,7 +399,7 @@ with st.sidebar:
                             text = (
                                 parsers.rows_to_text(rows)
                                 if rows is not None
-                                else parsers.parse_file(raw, uf.name)
+                                else parsers.parse_file(raw, uf.name, progress=_on_progress)
                             )
                             # 原始文件落盘（解析成功后才保存，避免留下损坏文件）；
                             # 仅取文件名，忽略路径成分，防止路径穿越

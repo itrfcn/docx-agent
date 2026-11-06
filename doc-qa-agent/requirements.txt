@@ -25,6 +25,13 @@ xlrd>=1.2,<2.0
 # .doc（Word 97-2003）解析依赖本机 Word，通过 COM 调用
 pywin32>=306; sys_platform == "win32"
 
+# ==================== OCR（扫描件 PDF / 图片） ====================
+# 本地离线 OCR，模型随包内置，无需联网；依赖 onnxruntime（安装时会自动带入）
+rapidocr-onnxruntime>=1.3.0
+# PDF 页面渲染（pdfplumber 的 to_image 依赖）与图片读取
+pypdfium2>=4.0.0
+Pillow>=10.0.0
+
 # ==================== 配置 ====================
 python-dotenv>=1.0.0
 

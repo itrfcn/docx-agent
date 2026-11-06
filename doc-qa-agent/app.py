@@ -34,8 +34,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from utils import parsers, vectorstore  # noqa: E402
-from utils.agent import ask_agent, get_last_sources  # noqa: E402
-from utils.config import cfg  # noqa: E402
+from utils.agent import ask_agent, get_last_sources, test_llm_connection  # noqa: E402
+from utils.config import cfg, mask_secret, save_llm_env  # noqa: E402
 from utils.preview import html_preview_url, pdf_preview_url, read_text, warmup_sources  # noqa: E402
 
 
@@ -218,13 +218,8 @@ st.set_page_config(
     layout="wide",
 )
 
-# ---- 首屏配置校验 ----
-# 缺失必填项时给出友好提示并停止渲染，而不是让未捕获异常导致整页崩溃
-_missing_cfg = cfg.missing_required()
-if _missing_cfg:
-    st.error("❌ 缺少必要配置：" + "、".join(_missing_cfg))
-    st.info("请在项目根目录的 .env 文件中填写上述配置后重新启动程序。")
-    st.stop()
+# 注意：配置校验移到了侧边栏渲染之后（见主区域前），
+# 这样缺配置时用户仍能在左侧「⚙️ API 设置」里补齐，而不是被 st.stop() 挡在门外。
 
 st.title("📚 企业文档问答助手")
 st.caption("面向企业内部员工 · 基于 LangChain ReAct Agent + Chroma + bge-small-zh")
@@ -237,11 +232,9 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
-# 侧边栏：文档管理（上传/清空仅管理员可用，文档列表全员可见）
+# 侧边栏：认证 → 文档列表（全员）→ 管理功能区（管理员）
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.header("📚 文档管理")
-
     # ---- 管理员认证 ----
     if "is_admin" not in st.session_state:
         st.session_state.is_admin = False
@@ -264,8 +257,19 @@ with st.sidebar:
         st.warning("⚠️ 未在 .env 配置 ADMIN_PASSWORD，管理功能已锁定（仅可查看文档列表）。")
     elif st.session_state.is_admin:
         st.success("🔓 管理员已登录")
-
-    if cfg.admin_password and not st.session_state.is_admin:
+        if st.button("🔒 退出管理"):
+            st.session_state.is_admin = False
+            # 同时清除 URL 中的令牌，避免刷新后又被自动登录
+            if "admin_token" in st.query_params:
+                del st.query_params["admin_token"]
+            st.rerun()
+        # 版本/配置提示（仅管理员可见）
+        with st.expander("🔧 当前配置"):
+            st.write(f"LLM: `{cfg.model_name}`")
+            st.write(f"Embedding: `{cfg.embedding_model}`")
+            st.write(f"向量库: `{cfg.chroma_persist_dir}`")
+            st.write(f"切片: size={cfg.chunk_size}, overlap={cfg.chunk_overlap}")
+    else:
         def _attempt_login() -> None:
             """校验输入框中的口令（回车提交与点击按钮共用）。"""
             pwd = st.session_state.get("admin_pwd_input", "")
@@ -295,134 +299,6 @@ with st.sidebar:
                 st.rerun()
         if st.session_state.get("admin_login_error"):
             st.error("口令错误，请重试")
-
-    if cfg.admin_password and st.session_state.is_admin:
-        # 清空操作的提示信息（跨 rerun 保留）
-        flash_msg = st.session_state.pop("clear_flash", None)
-        if flash_msg:
-            st.success(flash_msg)
-
-        # ---- 上传组件 ----
-        uploaded_files = st.file_uploader(
-            "上传文档（可多选）",
-            type=list(parsers.SUPPORTED_EXTENSIONS),
-            accept_multiple_files=True,
-            help="支持 PDF / DOCX / DOC / TXT / XLSX / XLS，不支持扫描件（无 OCR）。.doc 需服务端装有 Word。",
-        )
-
-        if uploaded_files:
-            col_ok, col_clear = st.columns(2)
-            if col_ok.button("✅ 入库所选文件", type="primary"):
-                progress_bar = st.progress(0.0, text="准备入库...")
-                total = len(uploaded_files)
-                success_count = 0
-                existing = set(vectorstore.list_sources())
-                for idx, uf in enumerate(uploaded_files):
-                    try:
-                        raw = uf.read()
-                        # Excel 走独立的行级切片路径（一行一个切片，不做字符切分）
-                        ext = Path(uf.name).suffix.lower().lstrip(".")
-                        rows = (
-                            parsers.parse_excel_rows(raw, uf.name, cfg.chunk_size)
-                            if ext in parsers.EXCEL_EXTENSIONS
-                            else None
-                        )
-                        text = (
-                            parsers.rows_to_text(rows)
-                            if rows is not None
-                            else parsers.parse_file(raw, uf.name)
-                        )
-                        # 原始文件落盘（解析成功后才保存，避免留下损坏文件）；
-                        # 仅取文件名，忽略路径成分，防止路径穿越
-                        safe_name = Path(uf.name).name
-                        cfg.docs_dir.mkdir(parents=True, exist_ok=True)
-                        (cfg.docs_dir / safe_name).write_bytes(raw)
-                        # 同名覆盖：ingest_document 内部会先删除同名旧切片再写入，
-                        # 此处仅用于区分提示文案（解析成功后才写库，失败不影响已有数据）
-                        overwritten = uf.name in existing
-                        chunks = vectorstore.ingest_document(text, uf.name, rows=rows)
-                        success_count += 1
-                        if overwritten:
-                            st.success(f"🔁 {uf.name} — 已覆盖更新，{chunks} 个切片")
-                        else:
-                            st.success(f"✅ {uf.name} — 入库 {chunks} 个切片")
-                    except parsers.DocParseError as e:
-                        st.error(f"❌ {uf.name} — {e}")
-                    except Exception as e:
-                        st.error(f"❌ {uf.name} — 未知错误：{e}")
-
-                    progress_bar.progress((idx + 1) / total, text=f"已处理 {idx + 1}/{total}")
-
-                progress_bar.empty()
-                st.info(f"入库完成：{success_count}/{total} 个文件成功。")
-
-            if col_clear.button("↩️ 取消选择"):
-                st.rerun()
-
-        # ---- 清空按钮（二次确认，防误删）----
-        st.divider()
-        if "confirm_clear" not in st.session_state:
-            st.session_state.confirm_clear = False
-
-        if not st.session_state.confirm_clear:
-            # 第一次点击只进入确认态，不执行清空
-            if st.button("🗑️ 清空整个知识库", type="secondary"):
-                st.session_state.confirm_clear = True
-                st.rerun()
-        else:
-            st.warning("⚠️ 此操作会删除全部已入库文档，且无法恢复。")
-            confirmed = st.checkbox("我确认要清空全部已入库文档")
-
-            col_yes, col_no = st.columns(2)
-            with col_yes:
-                do_clear = st.button(
-                    "确认清空",
-                    type="primary",
-                    disabled=not confirmed,
-                )
-            with col_no:
-                if st.button("取消"):
-                    st.session_state.confirm_clear = False
-                    st.rerun()
-
-            if do_clear:
-                # 二次确认通过后才真正执行
-                result = vectorstore.clear_knowledge_base()
-                docs = result.get("documents") or []
-                st.session_state.confirm_clear = False  # 执行完自动复位
-
-                if result.get("cleared"):
-                    msg = (
-                        "✅ 知识库已清空：向量集合已重建，"
-                        f"manifest 文档清单共 {len(docs)} 个"
-                    )
-                    msg += ("：" + "、".join(docs)) if docs else "。"
-                    if result.get("leftover"):
-                        msg += (
-                            "\n\nℹ️ 向量数据已清空，残留文件将在关闭程序后自动清理，不影响使用。"
-                        )
-                    st.session_state.clear_flash = msg
-                else:
-                    st.session_state.clear_flash = (
-                        "❌ 清空失败：知识库可能正被其它程序占用，请稍后重试。"
-                    )
-                st.rerun()
-
-        # ---- 退出管理 ----
-        if st.button("🔒 退出管理"):
-            st.session_state.is_admin = False
-            # 同时清除 URL 中的令牌，避免刷新后又被自动登录
-            if "admin_token" in st.query_params:
-                del st.query_params["admin_token"]
-            st.rerun()
-
-        # 版本/配置提示（仅管理员可见）
-        st.divider()
-        with st.expander("🔧 当前配置"):
-            st.write(f"LLM: `{cfg.model_name}`")
-            st.write(f"Embedding: `{cfg.embedding_model}`")
-            st.write(f"向量库: `{cfg.chroma_persist_dir}`")
-            st.write(f"切片: size={cfg.chunk_size}, overlap={cfg.chunk_overlap}")
 
     st.divider()
 
@@ -469,10 +345,205 @@ with st.sidebar:
     else:
         st.caption("（知识库为空，请先上传文档）")
 
+    # ---- 管理功能区 ----
+    _is_admin = bool(cfg.admin_password) and st.session_state.is_admin
+    if _is_admin or not cfg.admin_password:  # 本地无口令模式也能用 API 设置
+        st.divider()
+
+        if _is_admin:
+            # 清空/删除操作的提示信息（跨 rerun 保留）
+            flash_msg = st.session_state.pop("clear_flash", None)
+            if flash_msg:
+                st.success(flash_msg)
+
+            # ---- 上传组件（高频操作，保持平铺不收折）----
+            st.subheader("📤 上传文档")
+            uploaded_files = st.file_uploader(
+                "上传文档（可多选）",
+                type=list(parsers.SUPPORTED_EXTENSIONS),
+                accept_multiple_files=True,
+                help="支持 PDF / DOCX / DOC / TXT / XLSX / XLS，不支持扫描件（无 OCR）。.doc 需服务端装有 Word。",
+                label_visibility="collapsed",
+            )
+
+            if uploaded_files:
+                col_ok, col_clear = st.columns(2)
+                if col_ok.button("✅ 入库所选文件", type="primary"):
+                    progress_bar = st.progress(0.0, text="准备入库...")
+                    total = len(uploaded_files)
+                    success_count = 0
+                    existing = set(vectorstore.list_sources())
+                    for idx, uf in enumerate(uploaded_files):
+                        try:
+                            raw = uf.read()
+                            # Excel 走独立的行级切片路径（一行一个切片，不做字符切分）
+                            ext = Path(uf.name).suffix.lower().lstrip(".")
+                            rows = (
+                                parsers.parse_excel_rows(raw, uf.name, cfg.chunk_size)
+                                if ext in parsers.EXCEL_EXTENSIONS
+                                else None
+                            )
+                            text = (
+                                parsers.rows_to_text(rows)
+                                if rows is not None
+                                else parsers.parse_file(raw, uf.name)
+                            )
+                            # 原始文件落盘（解析成功后才保存，避免留下损坏文件）；
+                            # 仅取文件名，忽略路径成分，防止路径穿越
+                            safe_name = Path(uf.name).name
+                            cfg.docs_dir.mkdir(parents=True, exist_ok=True)
+                            (cfg.docs_dir / safe_name).write_bytes(raw)
+                            # 同名覆盖：ingest_document 内部会先删除同名旧切片再写入，
+                            # 此处仅用于区分提示文案（解析成功后才写库，失败不影响已有数据）
+                            overwritten = uf.name in existing
+                            chunks = vectorstore.ingest_document(text, uf.name, rows=rows)
+                            success_count += 1
+                            if overwritten:
+                                st.success(f"🔁 {uf.name} — 已覆盖更新，{chunks} 个切片")
+                            else:
+                                st.success(f"✅ {uf.name} — 入库 {chunks} 个切片")
+                        except parsers.DocParseError as e:
+                            st.error(f"❌ {uf.name} — {e}")
+                        except Exception as e:
+                            st.error(f"❌ {uf.name} — 未知错误：{e}")
+
+                        progress_bar.progress((idx + 1) / total, text=f"已处理 {idx + 1}/{total}")
+
+                    progress_bar.empty()
+                    st.info(f"入库完成：{success_count}/{total} 个文件成功。")
+
+                if col_clear.button("↩️ 取消选择"):
+                    st.rerun()
+
+            # ---- 危险操作（收折防误触；二次确认后执行）----
+            with st.expander("🗑️ 危险操作"):
+                if "confirm_clear" not in st.session_state:
+                    st.session_state.confirm_clear = False
+
+                if not st.session_state.confirm_clear:
+                    # 第一次点击只进入确认态，不执行清空
+                    if st.button("🗑️ 清空整个知识库", type="secondary"):
+                        st.session_state.confirm_clear = True
+                        st.rerun()
+                else:
+                    st.warning("⚠️ 此操作会删除全部已入库文档，且无法恢复。")
+                    confirmed = st.checkbox("我确认要清空全部已入库文档")
+
+                    col_yes, col_no = st.columns(2)
+                    with col_yes:
+                        do_clear = st.button(
+                            "确认清空",
+                            type="primary",
+                            disabled=not confirmed,
+                        )
+                    with col_no:
+                        if st.button("取消"):
+                            st.session_state.confirm_clear = False
+                            st.rerun()
+
+                    if do_clear:
+                        # 二次确认通过后才真正执行
+                        result = vectorstore.clear_knowledge_base()
+                        docs = result.get("documents") or []
+                        st.session_state.confirm_clear = False  # 执行完自动复位
+
+                        if result.get("cleared"):
+                            msg = (
+                                "✅ 知识库已清空：向量集合已重建，"
+                                f"manifest 文档清单共 {len(docs)} 个"
+                            )
+                            msg += ("：" + "、".join(docs)) if docs else "。"
+                            if result.get("leftover"):
+                                msg += (
+                                    "\n\nℹ️ 向量数据已清空，残留文件将在关闭程序后自动清理，不影响使用。"
+                                )
+                            st.session_state.clear_flash = msg
+                        else:
+                            st.session_state.clear_flash = (
+                                "❌ 清空失败：知识库可能正被其它程序占用，请稍后重试。"
+                            )
+                        st.rerun()
+
+        # ---- API 设置 ----
+        with st.expander("⚙️ API 设置"):
+            _ov = st.session_state.get("api_overrides") or {}
+            eff_key = _ov.get("openai_api_key") or cfg.openai_api_key
+            eff_url = _ov.get("openai_base_url") or cfg.openai_base_url
+            eff_model = _ov.get("model_name") or cfg.model_name
+            st.caption(
+                f"当前生效：{eff_model} @ {eff_url or '（未配置）'} ｜ 密钥 {mask_secret(eff_key)}"
+                f" ｜ 来源：{'本会话设置' if _ov else '全局默认（.env）'}"
+            )
+            api_url = st.text_input(
+                "API 地址", value=eff_url, key="api_url_input",
+                placeholder="https://api.openai.com/v1",
+            )
+            api_key = st.text_input(
+                "API 密钥", value=_ov.get("openai_api_key", ""), type="password",
+                key="api_key_input", placeholder="留空则沿用全局密钥",
+            )
+            api_model = st.text_input("模型名", value=eff_model, key="api_model_input")
+
+            col_test, col_apply = st.columns(2)
+            with col_test:
+                if st.button("测试连接", key="api_test_btn"):
+                    ok, msg = test_llm_connection(api_key or cfg.openai_api_key, api_url, api_model)
+                    (st.success if ok else st.error)(msg)
+            with col_apply:
+                if st.button("应用到本会话", key="api_apply_btn", type="primary"):
+                    if not api_url or not (api_key or cfg.openai_api_key):
+                        st.error("API 地址与密钥不能为空")
+                    else:
+                        st.session_state.api_overrides = {
+                            "openai_api_key": api_key,
+                            "openai_base_url": api_url,
+                            "model_name": api_model,
+                        }
+                        st.success("已应用，仅本会话生效")
+                        st.rerun()
+            if _ov and st.button("恢复默认", key="api_reset_btn"):
+                st.session_state.api_overrides = {}
+                st.session_state.api_key_input = ""
+                st.rerun()
+
+            # 全局默认：写回 .env，对所有人生效（需勾选确认）
+            st.divider()
+            st.caption("⚠️ 以下为全局默认：保存后写入 .env，对所有人生效")
+            st.checkbox("我确认要对全员生效", key="api_global_confirm")
+            if st.button("保存为全局默认", key="api_global_save"):
+                if not st.session_state.get("api_global_confirm"):
+                    st.error("请先勾选「我确认要对全员生效」")
+                elif not api_url or not (api_key or cfg.openai_api_key):
+                    st.error("API 地址与密钥不能为空")
+                else:
+                    try:
+                        save_llm_env(api_key or cfg.openai_api_key, api_url, api_model)
+                        st.success("已写入 .env，全局默认已更新")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"保存失败：{e}")
+
 
 # ---------------------------------------------------------------------------
 # 主区域：聊天界面
 # ---------------------------------------------------------------------------
+
+# ---- 配置校验（放在侧边栏之后：缺配置时仍可在左侧 API 设置中补齐）----
+_api_ov = st.session_state.get("api_overrides") or {}
+_missing_cfg: list[str] = []
+if not (_api_ov.get("openai_api_key") or cfg.openai_api_key):
+    _missing_cfg.append("OPENAI_API_KEY")
+if not (_api_ov.get("openai_base_url") or cfg.openai_base_url):
+    _missing_cfg.append("OPENAI_BASE_URL")
+if _missing_cfg:
+    st.error("❌ 缺少必要配置：" + "、".join(_missing_cfg))
+    _hint = "请在项目根目录 .env 中填写后重启"
+    if cfg.admin_password:
+        _hint += "；管理员登录后也可在左侧「⚙️ API 设置」中配置"
+    else:
+        _hint += "；也可在左侧「⚙️ API 设置」中配置"
+    st.info(_hint + "。")
+    st.stop()
 # 初始化会话状态
 if "messages" not in st.session_state:
     st.session_state.messages = []  # list of {"role": ..., "content": ...}
@@ -506,7 +577,7 @@ if prompt:
     with st.chat_message("assistant"):
         with st.spinner("🧠 思考中（知识库检索中,请耐心等待）..."):
             try:
-                answer = ask_agent(prompt, history_tuples)
+                answer = ask_agent(prompt, history_tuples, llm_overrides=st.session_state.get("api_overrides"))
             except Exception:
                 # 不把技术细节写进对话历史，只给用户友好提示
                 answer = "抱歉，当前无法完成回答，请稍后重试。"

@@ -84,3 +84,48 @@ class Config:
 # 单例
 cfg = Config()
 cfg.ensure_dirs()
+
+
+def mask_secret(value: str) -> str:
+    """密钥脱敏展示：只留前 3 后 4 位。"""
+    if not value:
+        return "（未配置）"
+    if len(value) <= 7:
+        return "****"
+    return f"{value[:3]}****{value[-4:]}"
+
+
+def save_llm_env(api_key: str, base_url: str, model: str) -> None:
+    """
+    把 LLM 配置原子写回 .env，并同步更新运行时 cfg（无需重启即生效）。
+
+    仅更新 OPENAI_API_KEY / OPENAI_BASE_URL / MODEL_NAME 三项，其余行原样保留；
+    先写临时文件再 os.replace，避免写一半导致 .env 损坏。
+    """
+    import re
+
+    env_path = _PROJECT_ROOT / ".env"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    updates = {
+        "OPENAI_API_KEY": api_key,
+        "OPENAI_BASE_URL": base_url,
+        "MODEL_NAME": model,
+    }
+    out: list[str] = []
+    for line in lines:
+        m = re.match(r"^([A-Z0-9_]+)\s*=", line)
+        if m and m.group(1) in updates:
+            out.append(f"{m.group(1)}={updates.pop(m.group(1))}")
+        else:
+            out.append(line)
+    for k, v in updates.items():  # 文件里原本没有的键，追加到末尾
+        out.append(f"{k}={v}")
+
+    tmp_path = env_path.with_name(".env.tmp")
+    tmp_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    os.replace(tmp_path, env_path)
+
+    # 同步运行时单例，立即对新会话/新 LLM 客户端生效
+    cfg.openai_api_key = api_key
+    cfg.openai_base_url = base_url
+    cfg.model_name = model

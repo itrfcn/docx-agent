@@ -138,8 +138,18 @@ def knowledge_search(query: str) -> str:
 # ---------------------------------------------------------------------------
 # 2. 构造 Agent（延迟初始化，避免 Streamlit 热重载时重复加载模型）
 # ---------------------------------------------------------------------------
-_agent_executor: AgentExecutor | None = None
-_llm: ChatOpenAI | None = None
+_agent_executors: dict[tuple[str, str, str], "AgentExecutor"] = {}
+_llm_cache: dict[tuple[str, str, str], "ChatOpenAI"] = {}
+
+
+def _llm_key() -> tuple[str, str, str]:
+    """当前会话生效的 LLM 配置：会话覆盖 > 环境变量/.env。"""
+    ov = getattr(_source_ctx, "llm_overrides", None) or {}
+    return (
+        ov.get("openai_api_key") or cfg.openai_api_key,
+        ov.get("openai_base_url") or cfg.openai_base_url,
+        ov.get("model_name") or cfg.model_name,
+    )
 
 
 class _LenientReActParser(ReActSingleInputOutputParser):
@@ -178,26 +188,52 @@ class _LenientReActParser(ReActSingleInputOutputParser):
 
 
 def _get_llm() -> ChatOpenAI:
-    """LLM 单例：60 秒超时 + 2 次重试，避免单次请求长时间卡住。"""
-    global _llm
-    if _llm is None:
-        _llm = ChatOpenAI(
-            api_key=cfg.openai_api_key,
-            base_url=cfg.openai_base_url,
-            model=cfg.model_name,
+    """按当前生效配置取 LLM：60 秒超时 + 2 次重试，避免单次请求长时间卡住。
+
+    不同配置（会话覆盖或全局默认值被管理员修改后）各自缓存一个客户端，
+    配置变化自动走新客户端，无需重启。
+    """
+    key = _llm_key()
+    if key not in _llm_cache:
+        _llm_cache[key] = ChatOpenAI(
+            api_key=key[0],
+            base_url=key[1],
+            model=key[2],
             temperature=0.1,
             streaming=False,
             timeout=60,
             max_retries=2,
         )
-    return _llm
+    return _llm_cache[key]
+
+
+def test_llm_connection(api_key: str, base_url: str, model: str) -> tuple[bool, str]:
+    """用最小请求探测 LLM 配置是否可用（设置面板的「测试连接」按钮用）。"""
+    if not api_key or not base_url:
+        return False, "API 地址和密钥都不能为空"
+    try:
+        ChatOpenAI(
+            api_key=api_key, base_url=base_url, model=model,
+            timeout=15, max_retries=0, max_tokens=1, streaming=False,
+        ).invoke("ping")
+        return True, "连接成功，配置可用"
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        if "401" in msg or "unauthorized" in low or "invalid api key" in low:
+            return False, "密钥无效（401），请检查 API 密钥"
+        if "timeout" in low or "timed out" in low:
+            return False, "连接超时，请检查 API 地址是否可达"
+        if "404" in msg or "not found" in low:
+            return False, "地址或模型名错误（404），请检查 API 地址与模型名"
+        return False, f"连接失败：{msg[:120]}"
 
 
 def get_agent_executor() -> AgentExecutor:
-    """获取 ReAct Agent 单例。"""
-    global _agent_executor
-    if _agent_executor is not None:
-        return _agent_executor
+    """获取当前生效配置对应的 ReAct Agent（按配置缓存）。"""
+    key = _llm_key()
+    if key in _agent_executors:
+        return _agent_executors[key]
 
     # 关闭 streaming，确保模型一次返回完整输出，避免 ReAct 格式被截断
     llm = _get_llm()
@@ -227,7 +263,7 @@ def get_agent_executor() -> AgentExecutor:
         output_parser=_LenientReActParser(),   # 漏写 Final Answer 前缀时直接采纳正文
     )
 
-    _agent_executor = AgentExecutor(
+    _agent_executors[key] = AgentExecutor(
         agent=agent,
         tools=tools,
         verbose=True,              # 控制台打印思考过程（生产可关）
@@ -241,7 +277,7 @@ def get_agent_executor() -> AgentExecutor:
         # 需要中间步骤来判断「是否真正调用过检索工具」（硬性规则见 _needs_force_retrieval）
         return_intermediate_steps=True,
     )
-    return _agent_executor
+    return _agent_executors[key]
 
 
 # ---------------------------------------------------------------------------
@@ -351,17 +387,24 @@ def _direct_answer(question: str) -> str:
     return answer
 
 
-def ask_agent(user_question: str, chat_history: list[tuple[str, str]] | None = None) -> str:
+def ask_agent(
+    user_question: str,
+    chat_history: list[tuple[str, str]] | None = None,
+    llm_overrides: dict | None = None,
+) -> str:
     """
     向 Agent 发起一次问答。
 
     Args:
         user_question: 用户当前提问
         chat_history:  历史对话，格式 [(human_msg, ai_msg), ...]
+        llm_overrides: 本会话的 LLM 配置覆盖（openai_api_key / openai_base_url / model_name），
+                       留空则使用 .env 全局配置
 
     Returns:
         Agent 最终回复文本（任何异常都会降级为友好中文答复，不返回技术报错）
     """
+    _source_ctx.llm_overrides = llm_overrides or {}  # 先于 executor 创建，决定用哪套配置
     executor = get_agent_executor()
     _source_ctx.items = []  # 重置本轮来源记录
     _source_ctx.search_calls = 0  # 重置检索计数（限制空转重试）

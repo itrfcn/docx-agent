@@ -715,21 +715,69 @@ def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
         doc.metadata.get("doc_type") == "excel" for doc in candidates
     ) else k
 
-    # 同一文件保留的片数上限：普通文档 3 片，Excel 5 片；并按内容去重
+    # 同一文件保留的片数上限：普通文档 3 片，Excel 5 片；并按内容去重。
+    # 两轮策略防止「单一来源高分候选先把 target 占满，其他来源正确片段被截断」：
+    #   1) 跨来源保底：候选跨 ≥2 个来源时，每个来源先拿 1 条（取该来源里重排分最高的那条）；
+    #      这样「国内各地区」Excel 不会一下子把 5 条额度吃完，境外表（如日本/越南）的正确片段
+    #      至少能拿到 1 条保底位置。
+    #   2) 再按分数补满：剩余额度继续按重排分顺序填，同时遵守 per-source 上限。
     per_source: dict[str, int] = {}
     seen_contents: set[str] = set()
     unique: list[Document] = []
+
+    # 去重后的候选（按重排分降序，后续两轮都用同一份排序保证确定性）
+    dedup: list[Document] = []
     for doc in candidates:
         content = doc.page_content or ""
         if not content or content in seen_contents:
             continue
-        source = doc.metadata.get("source", "")
-        limit = EXCEL_MAX_PER_SOURCE if doc.metadata.get("doc_type") == "excel" else MAX_PER_SOURCE
-        if per_source.get(source, 0) >= limit:
-            continue
         seen_contents.add(content)
-        per_source[source] = per_source.get(source, 0) + 1
-        unique.append(doc)
+        dedup.append(doc)
+
+    sources_in_order: list[str] = []
+    seen_sources: set[str] = set()
+    for doc in dedup:
+        src = doc.metadata.get("source", "")
+        if src and src not in seen_sources:
+            seen_sources.add(src)
+            sources_in_order.append(src)
+
+    seen_contents.clear()
+
+    # ---- 1) 跨来源保底 ----
+    cross_guard = len(sources_in_order) >= 2
+    if cross_guard:
+        for src in sources_in_order:
+            if len(unique) >= target:
+                break
+            for doc in dedup:
+                if doc.metadata.get("source", "") != src:
+                    continue
+                content = doc.page_content or ""
+                if not content or content in seen_contents:
+                    continue
+                seen_contents.add(content)
+                per_source[src] = 1
+                unique.append(doc)
+                break
+
+    # ---- 2) 剩余额度按重排分补齐 ----
+    for doc in dedup:
         if len(unique) >= target:
             break
+        content = doc.page_content or ""
+        if not content or content in seen_contents:
+            continue
+        src = doc.metadata.get("source", "")
+        limit = (
+            EXCEL_MAX_PER_SOURCE
+            if doc.metadata.get("doc_type") == "excel"
+            else MAX_PER_SOURCE
+        )
+        if per_source.get(src, 0) >= limit:
+            continue
+        seen_contents.add(content)
+        per_source[src] = per_source.get(src, 0) + 1
+        unique.append(doc)
+
     return unique

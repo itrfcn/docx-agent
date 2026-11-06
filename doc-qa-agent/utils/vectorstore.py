@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +38,16 @@ MANIFEST_PATH = cfg.chroma_persist_dir.parent / "manifest.json"
 
 # bge 官方约定：查询向量需加检索指令前缀（文档侧不加），可提升召回率
 QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
+# 查询同义词扩展：中文制度文件里同一概念常有多种写法（年假 / 年休假、工龄 / 工作年限），
+# 短查询直接向量化时会因字面差异排在后面。这里只在命中原词时「追加」同义说法，
+# 不改写用户原词，也不引入模型调用；新增领域术语时在这里补充即可。
+QUERY_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "年假": ("年休假", "年休假天数"),
+    "年休假": ("年假", "年休假天数"),
+    "工龄": ("工作年限", "本公司工作年限"),
+    "工作年限": ("工龄",),
+}
 
 # 同一来源最多保留的片段数：
 # - 普通文档：3 片（如「年假有几天」这类问题，答案集中在同一文件的相邻段落）
@@ -543,62 +554,160 @@ def _excel_lexical_scored(query: str, threshold: float) -> list[tuple[Document, 
     return scored
 
 
+def _expand_query(query: str) -> str:
+    """按 QUERY_SYNONYMS 给查询追加同义说法，只扩展不替换原词。"""
+    text = (query or "").strip()
+    if not text:
+        return text
+    extras: list[str] = []
+    for term, synonyms in QUERY_SYNONYMS.items():
+        if term not in text:
+            continue
+        for synonym in synonyms:
+            if synonym not in text and synonym not in extras:
+                extras.append(synonym)
+    return f"{text} {' '.join(extras)}" if extras else text
+
+
+# 重排模型：懒加载单例。加载失败（如内网无模型缓存）只记一次标记，
+# 后续直接走单阶段检索，不阻塞问答。
+_reranker = None
+_reranker_failed = False
+_rerank_lock = threading.Lock()
+
+
+def _get_reranker():
+    global _reranker, _reranker_failed
+    if _reranker_failed:
+        return None
+    if _reranker is None:
+        try:
+            from sentence_transformers import CrossEncoder
+
+            _reranker = CrossEncoder(cfg.rerank_model)
+        except Exception:
+            _reranker_failed = True
+            return None
+    return _reranker
+
+
+def _sigmoid(value: float) -> float:
+    """把重排模型的 logit 归一化到 0~1，便于设置统一阈值。"""
+    if value >= 0:
+        return 1.0 / (1.0 + math.exp(-value))
+    exp_value = math.exp(value)
+    return exp_value / (1.0 + exp_value)
+
+
+def _rerank_documents(query: str, docs: list[Document]) -> list[Document] | None:
+    """
+    用 cross-encoder 对候选片段精排。
+
+    返回 None 表示重排不可用（模型缺失 / 推理异常），调用方应回退到单阶段检索；
+    返回列表表示重排成功，列表可能为空（全部低于重排阈值）。
+    """
+    if not docs:
+        return []
+    model = _get_reranker()
+    if model is None:
+        return None
+    try:
+        pairs = [(query, (doc.page_content or "")[:2000]) for doc in docs]
+        with _rerank_lock:  # 共享模型实例，避免多会话并发推理
+            raw_scores = model.predict(pairs, batch_size=8, show_progress_bar=False)
+        # sentence-transformers 的单标签 cross-encoder 默认已内置 Sigmoid，
+        # predict 返回的本身就是 0~1 概率（bge-reranker 实测相关 0.93 / 无关 0.0006）。
+        # 这里只在模型确实输出越界 logit 时才兜底转换，
+        # 否则二次 sigmoid 会把无关片段压到 0.5 附近，让阈值彻底失效。
+        scores = [float(score) for score in raw_scores]
+        if any(score < 0.0 or score > 1.0 for score in scores):
+            scores = [_sigmoid(score) for score in scores]
+        ranked = sorted(zip(docs, scores), key=lambda item: item[1], reverse=True)
+        return [doc for doc, score in ranked if score >= cfg.rerank_threshold]
+    except Exception:
+        return None
+
+
+def _fallback_filter(
+    scored: list[tuple[Document, float]],
+    threshold: float,
+    query: str,
+) -> list[Document]:
+    """单阶段检索的过滤逻辑：向量阈值 + 关键词重叠，用于重排不可用时降级。"""
+    candidates = [doc for doc, score in scored if score is None or score >= threshold]
+    return [
+        doc
+        for doc in candidates
+        if doc.metadata.get("doc_type") == "excel"
+        or _keyword_overlap_ok(query, doc.page_content or "")
+    ]
+
+
 def similarity_search(query: str, top_k: int | None = None) -> list[Document]:
     """
-    根据 query 做相似度检索，返回 LangChain Document 列表。
+    根据 query 做两阶段检索，返回 LangChain Document 列表。
 
-    - 查询侧附加 bge 检索指令前缀（文档入库时不含前缀）
-    - 使用 similarity_search_with_relevance_scores 取带分数结果（要求 cosine 空间）
-    - 低于 cfg.relevance_threshold 的片段直接丢弃；全部低于阈值时返回空列表，
-      由调用方明确告知「未检索到相关片段」，避免硬凑无关内容
-    - Excel 片段额外做一次 IDF 词面补召回，解决实体词（国家/城市/职级）向量分过低的问题
-    - 关键词重叠兜底：向量分过了阈值但内容和 query 完全无关键词关联的也丢掉
-      （防止 LLM 改写查询词跑偏导致"年假"匹配到"出差补贴"这类假阳性）
-    - 同一来源最多保留 2 个片段：既保留同一文件的多个引用位置（供前端逐个定位），
-      又避免单个文件占满 top_k 名额，保证结果覆盖更多文档
+    1. 宽召回：向量取 RERANK_CANDIDATES 条候选（不再提前按向量阈值截断），
+       并与 Excel IDF 词面补召回结果合并；
+    2. 精排：cross-encoder 逐条判断 query 与片段的相关性，sigmoid 归一后按
+       RERANK_THRESHOLD 过滤，解决「年假 / 年休假」这类同义表达导致的向量低分。
+    重排不可用（模型缺失 / 推理失败）时，自动降级为单阶段检索：
+    向量阈值 + 关键词重叠过滤，保证系统始终可用。
+
+    其余规则：
+    - 同一来源最多保留 3 个片段（Excel 5 个），保证结果覆盖更多文档；
+    - 查询同义词扩展只作为召回辅助，不再承担主要判定职责。
     """
     k = top_k or cfg.retriever_top_k
     threshold = cfg.relevance_threshold
+    search_query = _expand_query(query)
     vs = get_vectorstore()
 
     # 候选数不能超过集合实际切片数，否则 hnswlib 会抛出
     # "Cannot return the results in a contigious 2D array. Probably ef or M is too small"
-    # 候选池放大：多个文件命中时，top_k*2 的池子容易被单个大文件占满，
-    # 导致其他文件（如海外标准里的一行）根本进不了候选，这里按 top_k*4 取。
-    want = k * 4
+    # 开启重排时扩大候选池，让向量阶段排名靠后的正确片段也有机会被精排捞回。
     count = _collection_count(vs)
     if count <= 0:
         return []  # 空集合直接返回，避免 hnswlib 在空索引上崩溃
+    want = max(k * 4, cfg.rerank_candidates) if cfg.rerank_enabled else k * 4
     n_results = min(want, count)
 
     scored: list[tuple[Document, float]]
     try:
         scored = vs.similarity_search_with_relevance_scores(
-            f"{QUERY_INSTRUCTION}{query}", k=n_results
+            f"{QUERY_INSTRUCTION}{search_query}", k=n_results
         )
     except Exception:
         try:
             # 兜底 1：普通相似度检索（不带相关性分数）
-            scored = [(doc, 1.0) for doc in vs.similarity_search(f"{QUERY_INSTRUCTION}{query}", k=n_results)]
+            scored = [(doc, 1.0) for doc in vs.similarity_search(f"{QUERY_INSTRUCTION}{search_query}", k=n_results)]
         except Exception:
             # 兜底 2：绕过 HNSW 索引，直接全量算相似度
-            scored = _brute_force_search(query, want)
+            scored = _brute_force_search(search_query, want)
 
     # Excel 词面补召回（混合检索）：实体词在向量空间区分度低，靠 IDF 加权把
     # 「印度」这类稀有命中顶到前面；与向量候选合并后统一按分数排序。
-    scored.extend(_excel_lexical_scored(query, threshold))
+    scored.extend(_excel_lexical_scored(query, threshold))  # Excel 补召回用原始 query，避免扩展词误伤
     scored.sort(key=lambda pair: pair[1] if pair[1] is not None else 0.0, reverse=True)
 
-    # 相关性阈值过滤
-    candidates = [doc for doc, score in scored if score is None or score >= threshold]
+    # 候选按内容去重，减少重排的重复计算（同一表格的相邻切片大量重叠）
+    deduped: list[Document] = []
+    seen_candidates: set[str] = set()
+    for doc, _score in scored:
+        content = doc.page_content or ""
+        if not content or content in seen_candidates:
+            continue
+        seen_candidates.add(content)
+        deduped.append(doc)
 
-    # 关键词重叠兜底：防止向量模型被 LLM 扩写的噪声词误导。
-    # Excel 行级切片本身很短、语义精确，且阈值已过滤，跳过该过滤避免误杀正确行。
-    candidates = [
-        doc for doc in candidates
-        if doc.metadata.get("doc_type") == "excel"
-        or _keyword_overlap_ok(query, doc.page_content or "")
-    ]
+    # 两阶段检索：重排器可用时由 cross-encoder 决定相关性；
+    # 不可用时降级为「向量阈值 + 关键词重叠」，保证功能不中断。
+    reranked = _rerank_documents(query, deduped) if cfg.rerank_enabled else None
+    if reranked is None:
+        # 降级时把候选池收回到与单阶段一致（k*4），避免宽召回的边缘噪声被阈值放进来
+        candidates = _fallback_filter(scored[: k * 4], threshold, search_query)
+    else:
+        candidates = reranked
 
     # Excel 片段需要多条一起才能答全「各职级标准」这类问题：
     # 命中表格时把最终条数上限抬到 EXCEL_MAX_PER_SOURCE（否则会被 top_k=4 压住）

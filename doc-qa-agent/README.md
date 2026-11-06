@@ -33,6 +33,7 @@
 | 文档入库       | 支持 PDF / DOCX / DOC / TXT / XLSX / XLS 及 JPG / PNG 等图片，可一次多选上传 |
 | 扫描件 OCR    | 扫描版 PDF 无文本层的页自动 OCR；图片直接 OCR，全程本地离线运行          |
 | 本地向量化      | 使用 `BAAI/bge-small-zh-v1.5` 本地 Embedding，文档内容不出内网 |
+| 两阶段检索      | 向量宽召回 top-30 + cross-encoder 精排，缓解「年假 / 年休假」等写法差异导致的漏召回 |
 | 持久化知识库     | Chroma 本地持久化，重启程序数据不丢失                            |
 | Agent 自主检索 | LangChain 原生 ReAct Agent，自主判断是否需要检索，只注册 1 个检索工具   |
 | 引用可回溯      | 回答标注 `【来源：文件名】`，并支持在浏览器中查看原文、自动定位到页码/行、下载原文件      |
@@ -57,12 +58,13 @@
 | Agent 框架  | LangChain 原生 `create_react_agent` + `AgentExecutor`       | 不使用 LangGraph           |
 | 向量库       | Chroma（本地持久化）                                             | cosine 距离空间             |
 | Embedding | sentence-transformers `BAAI/bge-small-zh-v1.5`            | 本地 CPU 运行，约 90 MB       |
+| 重排        | sentence-transformers CrossEncoder `BAAI/bge-reranker-base` | 两阶段检索精排，本地 CPU，约 1.1 GB |
 | 文档解析      | pdfplumber / python-docx / pywin32(COM) / openpyxl / xlrd | 见[支持的文档格式](#支持的文档格式)    |
 | OCR       | RapidOCR（onnxruntime）                                     | 本地离线运行，模型随包内置，无需联网            |
 | 配置        | python-dotenv                                             | 读取项目根目录 `.env`          |
 | LLM       | 通义千问（OpenAI 兼容接口）                                         | 默认 `qwen-plus`，可换任意兼容模型 |
 
-> 依赖版本在 `requirements.txt` 中锁定：LangChain 固定 `0.3.x`（`1.x` 已移除 ReAct 相关接口）；`.xls` 需要 `xlrd>=1.2,<2.0`；OCR 依赖 `rapidocr-onnxruntime`（会带入 onnxruntime 与 opencv），整体安装包会比无 OCR 版本大 100 MB 左右。
+> 依赖版本在 `requirements.txt` 中锁定：LangChain 固定 `0.3.x`（`1.x` 已移除 ReAct 相关接口）；`.xls` 需要 `xlrd>=1.2,<2.0`；OCR 依赖 `rapidocr-onnxruntime`（会带入 onnxruntime 与 opencv），整体安装包会比无 OCR 版本大 100 MB 左右；重排模型 `bge-reranker-base` 约 1.1 GB，首次使用需提前缓存。
 
 ## 工作原理
 
@@ -71,14 +73,14 @@
                                                         │
 用户提问 → ReAct Agent（Thought/Action） → knowledge_search ─┘
                     │
-                    ├─ 相似度检索 + 相关性阈值过滤 + 同源条数限制
+                    ├─ 向量宽召回 top-30 → cross-encoder 精排 → 同源条数限制
                     └─ LLM 基于片段作答 → 标注【来源：文件名】→ 前端提供原文预览
 ```
 
 几个关键设计：
 
 1. **检索固定使用用户原始问题**。LLM 自行扩写关键词会被忽略，避免长 query 带来的向量"维度诅咒"和假阳性来源。
-2. **宁可少答，不硬凑**。检索分数低于阈值（默认 `0.45`）的片段直接丢弃；确实没有资料时明确拒答。
+2. **宁可少答，不硬凑**。两阶段检索先按重排分数（默认 `0.30`）过滤；重排不可用时退回向量阈值（默认 `0.45`）。确实没有资料时明确拒答。
 3. **实质回答必须有真实检索支撑**。若模型没调用检索就直接给出长答案，或 ReAct 收敛失败，会自动走"直接检索 + 单次 LLM 直答"的降级路径。
 
 ## 目录结构
@@ -164,19 +166,35 @@ streamlit run app.py --server.port 8502
 HF_ENDPOINT=https://hf-mirror.com
 HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
+HF_HUB_DISABLE_XET=1
 ```
 
-**如果本机还没有** **`bge-small-zh-v1.5`** **缓存**，离线模式会导致模型加载失败。二选一：
+> `HF_HUB_DISABLE_XET=1` 必须保留。新版 `huggingface_hub` 默认用 Xet 协议传输大文件，而 hf-mirror 不支持 Xet，表现为下载到 200~300 MB 后长时间无进展、反复超时并留下多个 `.incomplete` 残片。关掉 Xet 后回退普通 HTTP 分块下载，可稳定续传。
+
+**如果本机还没有模型缓存**，离线模式会导致模型加载失败。需要缓存两个模型：
+
+- `BAAI/bge-small-zh-v1.5`（Embedding，约 90 MB）
+- `BAAI/bge-reranker-base`（重排，约 1.1 GB）
+
+二选一：
 
 - 临时去掉离线设置后启动一次，让模型自动下载（走 hf-mirror 镜像）；
-- 或先手动下载模型到本地缓存目录，再用 `EMBEDDING_MODEL` 指向本地路径。
+- 或先在在线终端预下载，再正常离线启动。
 
 ```powershell
 # 临时方式：在当前终端覆盖为在线模式
 $env:HF_HUB_OFFLINE = "0"
 $env:TRANSFORMERS_OFFLINE = "0"
+$env:HF_ENDPOINT = "https://hf-mirror.com"
+$env:HF_HUB_DISABLE_XET = "1"   # 关键：关闭 Xet，否则大文件会卡在半途
+
+# 预下载重排模型（Embedding 模型启动时会自动下载）
+python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-base')"
+
 streamlit run app.py
 ```
+
+> 重排模型未缓存时不会报错阻塞：检索会自动降级为单阶段向量检索。若希望强制关闭重排，设置 `RERANK_ENABLED=0`。
 
 ## 配置说明
 
@@ -193,7 +211,11 @@ streamlit run app.py
 | `CHUNK_SIZE`          | 否  | `400`                    | 文本切片长度（按中文字符）                                                       |
 | `CHUNK_OVERLAP`       | 否  | `64`                     | 切片重叠长度                                                              |
 | `RETRIEVER_TOP_K`     | 否  | `4`                      | 每次检索返回的片段数上限                                                        |
-| `RELEVANCE_THRESHOLD` | 否  | `0.45`                   | 相关性阈值（0\~1），低于该分数的片段不返回                                             |
+| `RELEVANCE_THRESHOLD` | 否  | `0.45`                   | 向量相关性阈值（0\~1）；仅在重排不可用时生效                                          |
+| `RERANK_ENABLED`      | 否  | `1`                      | 是否启用 cross-encoder 精排；设为 `0` 回退单阶段检索                              |
+| `RERANK_MODEL`        | 否  | `BAAI/bge-reranker-base` | 重排模型名或本地路径，首次使用需约 1.1 GB 缓存                                     |
+| `RERANK_CANDIDATES`   | 否  | `30`                     | 送入重排的候选片段数（宽召回池）                                               |
+| `RERANK_THRESHOLD`    | 否  | `0.30`                   | 重排分数（sigmoid 归一化到 0\~1）低于该值则丢弃                                |
 | `OCR_MIN_TEXT_CHARS`  | 否  | `20`                     | PDF 页面文本少于该字符数时视为扫描页并 OCR；设为 `0` 可关闭自动 OCR                          |
 | `OCR_DPI`             | 否  | `200`                    | 扫描页渲染 DPI；调高更清晰但明显更慢                                                |
 | `ADMIN_PASSWORD`      | 否  | 空                        | 管理口令；留空则锁定上传/删除/清空功能                                                |
@@ -262,13 +284,14 @@ streamlit run app.py
 
 | 机制          | 行为                                      |
 | ----------- | --------------------------------------- |
+| 向量宽召回       | 开启重排时取 top-30 候选（不再提前按阈值截断），避免正确片段被排名截断     |
+| cross-encoder 精排 | 对「问题-片段」逐条打分，sigmoid 归一后按 `RERANK_THRESHOLD` 过滤，理解同义表达 |
+| 降级检索        | 重排模型不可用时，自动退回向量阈值（`0.45`）+ 关键词重叠过滤          |
 | 查询指令前缀      | 查询向量附加 bge 官方检索指令，文档向量不加，提升中文召回         |
+| 同义词扩展       | 仅作为召回辅助，补齐「年假 / 年休假」「工龄 / 工作年限」等写法差异    |
 | 距离空间        | cosine，相关性分数 = `1 - 余弦距离`               |
-| 候选池         | 取 `top_k × 4`，避免单个大文件占满候选               |
-| 阈值过滤        | 低于 `RELEVANCE_THRESHOLD` 的片段直接丢弃        |
 | 同源限制        | 普通文档每个文件最多 3 片，Excel 最多 5 片，保证来源多样性     |
 | Excel 词面补召回 | 对稀有实体词（国家/城市/职级等）按 IDF 加权加分，解决向量区分度低的问题 |
-| 关键词重叠兜底     | 长查询命中片段必须与问题有词面交集，过滤 LLM 扩写带来的假阳性       |
 | 异常兜底        | HNSW 索引异常时自动降级为普通相似度检索，再降级为全量余弦暴力检索     |
 
 ### Agent 行为
@@ -345,7 +368,10 @@ python import_docs.py
 A：默认开启了 HF 离线模式。若本地没有模型缓存，请参考[首次运行与模型下载](#5-首次运行与模型下载)临时关闭离线模式，先完成一次下载。
 
 **Q：首次提问很慢？**
-A：首次需要加载 Embedding 模型和构建 LLM 客户端，通常需要数秒；后续问答会明显加快。
+A：首次需要加载 Embedding 与重排模型、构建 LLM 客户端，通常需要数秒到十几秒；后续问答会明显加快。若机器性能有限，可设置 `RERANK_ENABLED=0` 关闭精排。
+
+**Q：重排模型没下载成功会怎样？**
+A：不会报错阻塞。检索会自动降级为单阶段向量检索，但同义表达（如「年假」对「年休假」）的召回效果会下降。可按[首次运行与模型下载](#5-首次运行与模型下载)预下载，或把 `RERANK_MODEL` 指向本地模型目录；模型就绪后需重启 Streamlit 才会重新加载。
 
 **Q：`.doc`** **文件解析失败？**
 A：`.doc` 通过本机 Word COM 解析。请确认 Windows 已安装 Microsoft Word；否则用 Word 另存为 `.docx` 后重新上传。

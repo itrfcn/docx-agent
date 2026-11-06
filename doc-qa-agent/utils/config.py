@@ -59,8 +59,28 @@ class Config:
     retriever_top_k: int = field(default_factory=lambda: int(_env("RETRIEVER_TOP_K", default="4")))  # type: ignore[assignment]
     # 相关性阈值（0~1，越高越严格）：低于该分数的片段不返回。
     # cosine 空间下 relevance = 1 - 余弦距离，0.45 为经验起点。
+    # 开启重排后，该阈值只用于「重排不可用」时的降级路径。
     relevance_threshold: float = field(
         default_factory=lambda: float(_env("RELEVANCE_THRESHOLD", default="0.45"))
+    )
+
+    # ---- 重排（两阶段检索：宽召回 → cross-encoder 精排）----
+    # 关闭后回退到单阶段向量检索 + 阈值/关键词过滤
+    rerank_enabled: bool = field(
+        default_factory=lambda: (_env("RERANK_ENABLED", default="1") or "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    rerank_model: str = field(
+        default_factory=lambda: _env("RERANK_MODEL", default="BAAI/bge-reranker-base")
+        or "BAAI/bge-reranker-base"
+    )
+    # 送入重排的候选数：宽召回，避免相关片段在向量阶段就被截断
+    rerank_candidates: int = field(
+        default_factory=lambda: int(_env("RERANK_CANDIDATES", default="30"))  # type: ignore[assignment]
+    )
+    # 重排分数经 sigmoid 归一化到 0~1，低于该值的片段丢弃
+    rerank_threshold: float = field(
+        default_factory=lambda: float(_env("RERANK_THRESHOLD", default="0.30"))
     )
 
     # ---- OCR（扫描件 PDF / 图片）----

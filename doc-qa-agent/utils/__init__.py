@@ -16,6 +16,10 @@ import os
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")  # 彻底跳过联网超时检查（省 ~5-8 秒）
+# 关闭 HuggingFace 的 Xet 传输后端：hf-mirror 镜像不支持 Xet 协议，
+# 新版 huggingface_hub 默认走 Xet 时会在 200~300MB 处反复卡死/超时重试。
+# 关掉后回退到普通 HTTP 分块下载，实测可稳定续传至完成。
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 # 关闭 Chroma 匿名遥测：离线环境上报必然失败，只会刷无害报错日志
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 

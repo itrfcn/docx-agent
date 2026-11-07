@@ -571,6 +571,52 @@ def _split_pairs(
     return pieces
 
 
+# 备注类列名关键字：这些列的文本才可能是「全表通用规则」
+_NOTE_HEADER_HINTS = ("备注", "说明", "注")
+
+# 通用备注的最短长度与跨行重复门槛：
+# 太短的值（「实报实销」「是」「无」）虽然重复很多次，但不是规则条文；
+# 只有长度足够且在多行重复出现的文本，才视为被分散填充的通用规则。
+_SHARED_NOTE_MIN_CHARS = 10
+_SHARED_NOTE_MIN_ROWS = 3
+
+
+def _collect_shared_notes(
+    headers: list[str], grid: list[list[str]], data_start: int
+) -> list[tuple[str, int]]:
+    """
+    收集「在全表多行重复出现」的备注文本。
+
+    部分 Excel 把同一组备注拆成「备注1 / 备注2 / 备注3」多列，每行只填其中一列，
+    导致通用规则（如「伙食补贴标准：早餐15元，午餐25元，晚餐30元」）被分散绑定到
+    个别地区行上。问其他地区时，模型只能看到「那是青岛的标准」，不敢用于北京。
+    这里把重复出现的备注抽出来单列一段，明确标注适用于全表。
+    """
+    note_cols = [
+        i for i, h in enumerate(headers) if any(k in h for k in _NOTE_HEADER_HINTS)
+    ]
+    if not note_cols:
+        return []
+
+    counts: dict[str, int] = {}
+    for r in range(data_start, len(grid)):
+        cells = grid[r]
+        # 按「行」去重：合并单元格展开后同一行的备注 / 备注_2 / 备注_3 值相同，
+        # 逐单元格累加会把行数放大数倍，展示给模型的重复行数就不准了。
+        row_values = {
+            (cells[c] or "").strip()
+            for c in note_cols
+            if c < len(cells)
+        }
+        for value in row_values:
+            if len(value) >= _SHARED_NOTE_MIN_CHARS:
+                counts[value] = counts.get(value, 0) + 1
+
+    # 返回 (文本, 重复行数)：重复次数只作为「可能是通用规则」的线索，
+    # 不代表一定适用于全表——也可能是若干地区共用的片区规则。
+    return [(text, n) for text, n in counts.items() if n >= _SHARED_NOTE_MIN_ROWS]
+
+
 def _build_sheet_chunks(sheet_name: str, grid: list[list[str]], max_chars: int) -> list[dict]:
     """把一个工作表转成行级切片列表。"""
     headers, data_start, title = _detect_layout(grid)
@@ -609,6 +655,22 @@ def _build_sheet_chunks(sheet_name: str, grid: list[list[str]], max_chars: int) 
             continue
         for content in _split_pairs(prefix, pairs, pairs[:2], max_chars):
             chunks.append({"content": content, "sheet": sheet_name, "row": r + 1})
+
+    # 通用备注单独成片：让「问北京早中晚」这类问题也能命中被分散到其他行的通用规则
+    shared_notes = _collect_shared_notes(headers, grid, data_start)
+    if shared_notes:
+        max_rows = max(n for _text, n in shared_notes)
+        chunks.append({
+            # 「早中晚三餐」是用户侧常用说法，写进描述里让词面补召回也能命中这段通用规则。
+            # 这里只陈述「多行重复出现」这一客观事实，不断言「适用于所有地区」：
+            # 重复也可能只是若干地区共用的片区规则，适用范围交给模型结合原文判断。
+            "content": prefix
+            + f"全表通用说明（早中晚三餐；以下说明在表中最多 {max_rows} 行重复出现，"
+            + "请结合具体地区判断适用范围）："
+            + "；".join(text for text, _n in shared_notes),
+            "sheet": sheet_name,
+            "row": 0,
+        })
     return chunks
 
 
